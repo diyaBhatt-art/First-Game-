@@ -1,0 +1,84 @@
+{
+  "items": [
+    {
+      "id": "footprints",
+      "name": "Footprints",
+      "description": "See the Murderer's trail on the floor for 5 seconds.",
+      "tier": "cheap",
+      "price": 50,
+      "target_role": "any",
+      "effect": "effect_footprints",
+      "uses_per_round": 2
+    },
+    {
+      "id": "tracker",
+      "name": "Tracker",
+      "description": "An arrow briefly points toward the Murderer.",
+      "tier": "mid",
+      "price": 150,
+      "target_role": "any",
+      "effect": "effect_tracker",
+      "uses_per_round": 1
+    },
+    {
+      "id": "aura_scan",
+      "name": "Aura Scan",
+      "description": "All players flash their role color for 2 seconds.",
+      "tier": "mid",
+      "price": 200,
+      "target_role": "any",
+      "effect": "effect_aura_scan",
+      "uses_per_round": 1
+    },
+    {
+      "id": "shadow_blade",
+      "name": "Shadow Blade",
+      "description": "Murderer only: instant kill from any distance, one use.",
+      "tier": "premium",
+      "price": 1500,
+      "target_role": "murderer",
+      "effect": "effect_shadow_blade",
+      "uses_per_round": 1
+    },
+    {
+      "id": "noise_trap",
+      "name": "Noise Trap",
+      "description": "Place a trap at your position. If the Murderer walks over it, their screen shakes for 3 seconds.",
+      "tier": "cheap",
+      "price": 60,
+      "target_role": "any",
+      "effect": "effect_noise_trap",
+      "uses_per_round": 2
+    },
+    {
+      "id": "alarm",
+      "name": "Alarm",
+      "description": "The Murderer's screen shakes when they get within 100px of you for the next 30 seconds.",
+      "tier": "mid",
+      "price": 180,
+      "target_role": "any",
+      "effect": "effect_alarm",
+      "uses_per_round": 1
+    },
+    {
+      "id": "ghost_mode",
+      "name": "Ghost Mode",
+      "description": "Become semi-transparent and untargetable by the Murderer for 10 seconds.",
+      "tier": "premium",
+      "price": 1200,
+      "target_role": "innocent",
+      "effect": "effect_ghost_mode",
+      "uses_per_round": 1
+    },
+    {
+      "id": "dead_eye",
+      "name": "Dead Eye",
+      "description": "Your next bullet auto-aims at the Murderer if they are within 300 pixels.",
+      "tier": "premium",
+      "price": 1800,
+      "target_role": "sheriff",
+      "effect": "effect_dead_eye",
+      "uses_per_round": 1
+    }
+  ]
+}

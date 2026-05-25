@@ -1,0 +1,37 @@
+{
+  "roles": [
+    {
+      "id": "murderer",
+      "name": "Murderer",
+      "color": "#e53170",
+      "icon": "knife",
+      "goal": "Kill everyone before time runs out.",
+      "has_knife": true,
+      "has_gun": false,
+      "can_kill": ["innocent", "sheriff"],
+      "min_players_required": 2
+    },
+    {
+      "id": "sheriff",
+      "name": "Sheriff",
+      "color": "#f4c542",
+      "icon": "badge",
+      "goal": "Find and shoot the Murderer.",
+      "has_knife": false,
+      "has_gun": true,
+      "gun_targets": ["murderer"],
+      "min_players_required": 4
+    },
+    {
+      "id": "innocent",
+      "name": "Innocent",
+      "color": "#2cb5e8",
+      "icon": "person",
+      "goal": "Survive until time runs out.",
+      "has_knife": false,
+      "has_gun": false,
+      "can_pickup_gun": true,
+      "min_players_required": 2
+    }
+  ]
+}
