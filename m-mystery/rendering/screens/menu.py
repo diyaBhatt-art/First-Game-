@@ -9,6 +9,8 @@ TAGLINES = [
     "Everyone is a suspect.",
 ]
 
+BG_TOP = (45, 120, 200)
+BG_BOTTOM = (25, 60, 120)
 BG_COLOR = (26, 26, 46)
 BTN_COLOR = (60, 60, 100)
 BTN_HOVER = (80, 80, 140)
@@ -57,7 +59,13 @@ class MenuScreen:
         pass
 
     def draw(self, screen):
-        screen.fill(BG_COLOR)
+        h = screen.get_height()
+        for y in range(h):
+            t = y / h
+            r = int(BG_TOP[0] * (1 - t) + BG_BOTTOM[0] * t)
+            g = int(BG_TOP[1] * (1 - t) + BG_BOTTOM[1] * t)
+            b = int(BG_TOP[2] * (1 - t) + BG_BOTTOM[2] * t)
+            pygame.draw.line(screen, (r, g, b), (0, y), (screen.get_width(), y))
 
         # Title
         title = self.font_title.render("M MYSTERY", True, TITLE_COLOR)

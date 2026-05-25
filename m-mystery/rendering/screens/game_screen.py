@@ -6,6 +6,7 @@ from core.player import Player
 from core.round import RoundManager
 from core.shop import ShopManager
 from rendering.screens.shop_screen import ShopScreen
+from rendering.avatar import draw_avatar
 
 # Role hex → RGB for the aura_scan effect
 ROLE_COLORS = {
@@ -68,6 +69,12 @@ class GameScreen:
 
         # --- Murderer position trail (for footprints effect) ---
         self.murderer_trail = []  # list of (x, y), max 20 entries
+
+        # --- Map dimensions for floor grid ---
+        self.map_w = map_data.get("width", 800)
+        self.map_h = map_data.get("height", 600)
+
+        self._prev_alive = {p.id: (p.x, p.y) for p in players if p.is_alive}
 
         # --- Noise traps (placed by Noise Trap item) ---
         self.noise_traps = []
@@ -197,7 +204,17 @@ class GameScreen:
         keys = pygame.key.get_pressed()
         dx = 0.0
         dy = 0.0
-        speed = self.human.speed
+        sprinting = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+        speed = self.human.sprint_speed if sprinting else self.human.speed
+
+        if sprinting and (keys[pygame.K_w] or keys[pygame.K_s] or keys[pygame.K_a] or keys[pygame.K_d]):
+            if self.human.stamina > 0:
+                self.human.stamina = max(0, self.human.stamina - 0.8)
+            else:
+                speed = self.human.speed
+        else:
+            self.human.stamina = min(self.human.max_stamina, self.human.stamina + 0.5)
+
         if keys[pygame.K_w]:
             dy = -speed
         if keys[pygame.K_s]:
@@ -213,13 +230,17 @@ class GameScreen:
 
         self.human.move(dx, dy, self.walls)
 
+        buck_positions = [(b[0], b[1]) for b in self.bucks]
         for p in self.players:
             if p.is_bot and p.is_alive:
-                bullet = p.update(self.players, self.walls, self.dropped_gun_pos)
+                bullet = p.update(
+                    self.players, self.walls, self.dropped_gun_pos, buck_positions
+                )
                 if bullet:
                     self.bullets.append(bullet)
 
         self._update_bullets()
+        self._check_deaths_witness()
         self._check_dropped_gun()
         self._check_buck_collection()
 
@@ -273,6 +294,28 @@ class GameScreen:
                     bullet.is_active = False
                     self.bullets.remove(bullet)
                     break
+
+    def _check_deaths_witness(self):
+        """Notify bot brains when someone dies (witness / suspicion)."""
+        current = {}
+        for p in self.players:
+            if p.is_alive:
+                current[p.id] = (p.x, p.y)
+
+        for pid, pos in self._prev_alive.items():
+            if pid not in current:
+                death_x, death_y = pos
+                for p in self.players:
+                    if not p.is_bot or not p.is_alive:
+                        continue
+                    dx = p.x - death_x
+                    dy = p.y - death_y
+                    if math.sqrt(dx * dx + dy * dy) < 200:
+                        p.brain.on_witness_death(
+                            self.players, death_x, death_y, pid
+                        )
+
+        self._prev_alive = current
 
     def _check_dropped_gun(self):
         if self.dropped_gun_pos is None:
@@ -403,11 +446,13 @@ class GameScreen:
             ox = random.randint(-shake["intensity"], shake["intensity"])
             oy = random.randint(-shake["intensity"], shake["intensity"])
 
-        screen.fill((30, 30, 30))
+        self._draw_floor(screen, ox, oy)
 
         for wall in self.walls:
-            pygame.draw.rect(screen, (60, 60, 60),
+            pygame.draw.rect(screen, (72, 88, 72),
                              (wall.x + ox, wall.y + oy, wall.w, wall.h))
+            pygame.draw.rect(screen, (55, 68, 55),
+                             (wall.x + ox, wall.y + oy, wall.w, wall.h), 2)
 
         # Noise traps
         for trap in self.noise_traps:
@@ -426,15 +471,13 @@ class GameScreen:
         for player in self.players:
             if not player.is_alive:
                 continue
-            cx, cy = int(player.x) + ox, int(player.y) + oy
-            if player.id == ghost_id:
-                surf = pygame.Surface((28, 28), pygame.SRCALPHA)
-                pygame.draw.circle(surf, (*player.color, 80), (14, 14), 10)
-                pygame.draw.circle(surf, (255, 255, 255, 80), (14, 14), 3)
-                screen.blit(surf, (cx - 14, cy - 14))
-            else:
-                pygame.draw.circle(screen, player.color, (cx, cy), 10)
-                pygame.draw.circle(screen, (255, 255, 255), (cx, cy), 3)
+            alpha = 90 if player.id == ghost_id else 255
+            draw_avatar(screen, player, ox, oy, show_name=True, alpha=alpha)
+
+        # Knife range hint for murderer (human)
+        if self.human.is_alive and self.human.has_knife:
+            cx, cy = int(self.human.x) + ox, int(self.human.y) + oy
+            pygame.draw.circle(screen, (229, 49, 112), (cx, cy), 40, 1)
 
         for bullet in self.bullets:
             if bullet.is_active:
@@ -457,14 +500,16 @@ class GameScreen:
         # --- HUD (no shake offset) ---
         timer_str = self.round_manager.get_time_string()
         bucks_str = f"{self.human.m_bucks_this_round} / 50"
+        role_hint = self.human.role.upper() if self.human.role else "?"
         hud_text = (
-            f"Timer: {timer_str} | Alive: {self.alive_count} | "
-            f"M Bucks: {bucks_str}"
+            f"{role_hint}  |  {timer_str}  |  Alive: {self.alive_count}  |  "
+            f"Bucks: {bucks_str}  |  Shift=Sprint  Space=Attack  E=Shop"
         )
-        font = pygame.font.Font(None, 28)
+        font = pygame.font.Font(None, 24)
         hud_surf = font.render(hud_text, True, (255, 255, 255))
-        pygame.draw.rect(screen, (0, 0, 0), (0, 0, screen.get_width(), 30))
-        screen.blit(hud_surf, (10, 5))
+        pygame.draw.rect(screen, (25, 25, 35), (0, 0, screen.get_width(), 32))
+        screen.blit(hud_surf, (10, 6))
+        self._draw_stamina_bar(screen)
 
         # --- Shop overlay (no shake offset) ---
         if self.shop_open:
@@ -473,6 +518,31 @@ class GameScreen:
         # --- ESC quit confirmation dialog (no shake offset) ---
         if self._show_quit_dialog:
             self._draw_quit_dialog(screen)
+
+    def _draw_floor(self, screen, ox, oy):
+        """Stud-style floor plate pattern (Roblox baseplate feel)."""
+        screen.fill((92, 130, 92))
+        tile = 40
+        for x in range(0, self.map_w, tile):
+            for y in range(0, self.map_h, tile):
+                shade = 4 if (x // tile + y // tile) % 2 == 0 else -4
+                c = (
+                    max(0, 92 + shade),
+                    max(0, 130 + shade),
+                    max(0, 92 + shade),
+                )
+                pygame.draw.rect(
+                    screen, c,
+                    (x + ox, y + oy, tile, tile),
+                )
+
+    def _draw_stamina_bar(self, screen):
+        pct = self.human.stamina / self.human.max_stamina
+        bar = pygame.Rect(screen.get_width() - 110, 8, 100, 10)
+        pygame.draw.rect(screen, (40, 40, 50), bar, border_radius=4)
+        fill = pygame.Rect(bar.x, bar.y, int(bar.w * pct), bar.h)
+        col = (80, 200, 120) if pct > 0.25 else (200, 80, 80)
+        pygame.draw.rect(screen, col, fill, border_radius=4)
 
     def _draw_active_effects(self, screen, ox=0, oy=0):
         """Draw timed effect visuals (footprints, tracker, aura_scan)."""

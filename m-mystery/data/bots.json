@@ -1,7 +1,14 @@
 {
   "bots": [
-    { "id": "bot_murderer", "role": "murderer", "speed": 2.5 },
-    { "id": "bot_sheriff",  "role": "sheriff",  "speed": 2.0, "shoot_range": 150 },
-    { "id": "bot_innocent", "role": "innocent", "speed": 2.0, "flee_range": 200 }
-  ]
+    { "id": "bot_murderer", "role": "murderer", "speed": 2.6 },
+    { "id": "bot_sheriff",  "role": "sheriff",  "speed": 2.1, "shoot_range": 165 },
+    { "id": "bot_innocent", "role": "innocent", "speed": 2.0, "flee_range": 210 }
+  ],
+  "personalities": {
+    "balanced": { "aggression": 0.5, "caution": 0.5, "greed": 0.4, "accuracy": 0.72 },
+    "aggressive": { "aggression": 0.85, "caution": 0.25, "greed": 0.3, "accuracy": 0.65 },
+    "cautious": { "aggression": 0.3, "caution": 0.85, "greed": 0.5, "accuracy": 0.8 },
+    "greedy": { "aggression": 0.4, "caution": 0.45, "greed": 0.9, "accuracy": 0.6 },
+    "sharp": { "aggression": 0.55, "caution": 0.6, "greed": 0.35, "accuracy": 0.92 }
+  }
 }

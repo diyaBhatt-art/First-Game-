@@ -10,14 +10,15 @@ PLAYER_SIZE = 20
 class Player:
     """Represents a player (human or bot) with position, movement and collision."""
 
-    def __init__(self, pid, name, color, is_bot=False, is_alive=True):
+    def __init__(self, pid, name, color, is_bot=False, is_alive=True,
+                 body_color=None, shirt_color=None, pants_color=None, skin_color=None):
         """
         Set up a new player.
 
         Args:
             pid: unique string id
             name: display name
-            color: RGB tuple e.g. (44, 181, 232)
+            color: RGB tuple e.g. (44, 181, 232) — accent / legacy
             is_bot: True if this is an AI bot
             is_alive: whether the player is still alive
         """
@@ -27,12 +28,26 @@ class Player:
         self.is_bot = is_bot
         self.is_alive = is_alive
 
+        # Roblox-style avatar colors
+        self.body_color = body_color or color
+        self.shirt_color = shirt_color or _shade_color(color, 20)
+        self.pants_color = pants_color or _shade_color(color, -40)
+        self.skin_color = skin_color or (255, 204, 153)
+
         # Position (centre of the player rectangle)
         self.x = 0.0
         self.y = 0.0
 
+        # Facing & animation
+        self.facing = (0.0, -1.0)
+        self.anim_phase = 0.0
+        self.is_moving = False
+
         # Movement speed in pixels per frame
         self.speed = 3
+        self.sprint_speed = 5
+        self.stamina = 100.0
+        self.max_stamina = 100.0
 
         # Role-related flags
         self.has_knife = False
@@ -60,17 +75,28 @@ class Player:
         size = PLAYER_SIZE
         half = size // 2
 
+        moved = False
         # --- Try moving on the X axis ---
         new_x = self.x + dx
         test_rect = pygame.Rect(new_x - half, self.y - half, size, size)
         if not any(test_rect.colliderect(w) for w in walls):
             self.x = new_x
+            moved = True
 
         # --- Try moving on the Y axis ---
         new_y = self.y + dy
         test_rect = pygame.Rect(self.x - half, new_y - half, size, size)
         if not any(test_rect.colliderect(w) for w in walls):
             self.y = new_y
+            moved = True
+
+        if moved and (dx != 0 or dy != 0):
+            length = math.sqrt(dx * dx + dy * dy)
+            self.facing = (dx / length, dy / length)
+            self.is_moving = True
+            self.anim_phase += 0.25
+        else:
+            self.is_moving = False
 
     def try_kill(self, target):
         """
@@ -145,3 +171,7 @@ class Player:
         actual = min(amount, space)
         self.m_bucks_this_round += actual
         return actual
+
+
+def _shade_color(rgb, delta):
+    return tuple(max(0, min(255, c + delta)) for c in rgb)

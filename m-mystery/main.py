@@ -37,15 +37,30 @@ def main():
     selected_map_ref = [0]  # index into available_maps (mutable for sharing)
 
     # ---- Persistent state ----
-    human = Player("p1", "Player 1", (44, 181, 232))
-    # Bots exist in the lobby list from the start (positions set when a round begins)
+    human = Player(
+        "p1", "Guest_You", (44, 181, 232),
+        body_color=(44, 181, 232),
+        shirt_color=(30, 140, 200),
+        pants_color=(35, 55, 120),
+        skin_color=(255, 204, 153),
+    )
     default_map = available_maps[0]["data"]
     spawns = default_map["spawn_points"]
-    bots = [
-        Bot("bot_1", "Bot 1", (148, 161, 178), spawns[1]["x"], spawns[1]["y"]),
-        Bot("bot_2", "Bot 2", (148, 161, 178), spawns[2]["x"], spawns[2]["y"]),
-        Bot("bot_3", "Bot 3", (148, 161, 178), spawns[3]["x"], spawns[3]["y"]),
+    bot_roster = [
+        ("bot_1", "xXShadowBladeXx", "aggressive",
+         (229, 80, 120), (200, 50, 90), (60, 30, 80), (40, 20, 30)),
+        ("bot_2", "CoolSheriff_Jake", "sharp",
+         (244, 197, 66), (220, 170, 40), (50, 50, 90), (80, 60, 30)),
+        ("bot_3", "NoobSurvivor42", "cautious",
+         (100, 200, 255), (70, 160, 230), (40, 70, 110), (60, 100, 140)),
     ]
+    bots = []
+    for i, (bid, name, pers, accent, shirt, pants, hair) in enumerate(bot_roster):
+        bots.append(Bot(
+            bid, name, accent, spawns[i + 1]["x"], spawns[i + 1]["y"],
+            personality_id=pers,
+            body_color=hair, shirt_color=shirt, pants_color=pants,
+        ))
     all_players = [human] + bots
     wallet_manager = WalletManager()
 
@@ -70,6 +85,8 @@ def main():
                 p.ticks_left = 0
                 p.dx = 0
                 p.dy = 0
+                p.brain.reset_round()
+            p.stamina = p.max_stamina
 
     # ------------------------------------------------------------------
     # Helper: go to main menu
