@@ -1,7 +1,8 @@
 import json
 import os
-import pygame
+import subprocess
 import sys
+import pygame
 
 from core.player import Player
 from core.bot import Bot
@@ -156,8 +157,18 @@ def main():
     # Create screens (menu and lobby are created once)
     # ------------------------------------------------------------------
 
+    def launch_3d():
+        pygame.quit()
+        root = os.path.dirname(os.path.abspath(__file__))
+        subprocess.Popen(
+            [sys.executable, os.path.join(root, "main_3d.py")],
+            cwd=root,
+        )
+        sys.exit()
+
     menu_screen = MenuScreen(
         on_play=lambda: manager.transition_to("lobby"),
+        on_play_3d=launch_3d,
         on_settings=lambda: print("[MENU] Settings (placeholder)"),
         on_quit=lambda: sys.exit(),
     )

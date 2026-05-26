@@ -143,6 +143,11 @@ class BotBrain:
             return None
         return candidates[0][1]
 
+    def _ret(self, direction, shoot_dir=None):
+        """Normalize to (dx, dy, shoot_dir)."""
+        dx, dy = direction
+        return dx, dy, shoot_dir
+
     def steer_clear_of_walls(self, dx, dy, walls, probe=28):
         """Nudge direction away from nearby walls."""
         bot = self.bot
@@ -186,7 +191,7 @@ class BotBrain:
             if p is not bot and p.is_alive and not getattr(p, "ghost", False)
         ]
         if not targets:
-            return self._wander(walls)
+            return self._ret(self._wander(walls))
 
         # Prefer isolated victims (MM2-style stalking)
         best = None
@@ -218,10 +223,10 @@ class BotBrain:
             if witnesses >= 2 and d > 60:
                 # Blend in: sometimes move toward bucks instead
                 if bucks and random.random() < 0.35 * (1 - self.aggression):
-                    return self._toward_point(bucks[0], bucks[1], walls)
-            return self.steer_clear_of_walls(dx, dy, walls)
+                    return self._ret(self._toward_point(bucks[0], bucks[1], walls))
+            return self._ret(self.steer_clear_of_walls(dx, dy, walls))
 
-        return self._wander(walls)
+        return self._ret(self._wander(walls))
 
     def _sheriff_dir(self, all_players, walls, dropped_gun_pos, bucks):
         bot = self.bot
@@ -244,7 +249,7 @@ class BotBrain:
                 elif d < bot.shoot_range * 0.7 and not confident:
                     # Hesitate — back up like a real player
                     dx, dy = _norm(bot.x - suspect.x, bot.y - suspect.y)
-                    return self.steer_clear_of_walls(dx, dy, walls), None
+                    return self._ret(self.steer_clear_of_walls(dx, dy, walls))
 
         if self.action_cooldown > 0:
             self.action_cooldown -= 1
@@ -254,17 +259,17 @@ class BotBrain:
             d = _dist(bot.x, bot.y, threat.x, threat.y)
             if d < 160 + self.caution * 80:
                 dx, dy = _norm(bot.x - threat.x, bot.y - threat.y)
-                return self.steer_clear_of_walls(dx, dy, walls), shoot_dir
+                return self._ret(self.steer_clear_of_walls(dx, dy, walls), shoot_dir)
 
         if dropped_gun_pos and not bot.has_gun:
             gx, gy = dropped_gun_pos
             if _dist(bot.x, bot.y, gx, gy) < 200:
-                return self._toward_point(gx, gy, walls), shoot_dir
+                return self._ret(self._toward_point(gx, gy, walls), shoot_dir)
 
         if bucks and random.random() < self.greed:
-            return self._toward_point(bucks[0], bucks[1], walls), shoot_dir
+            return self._ret(self._toward_point(bucks[0], bucks[1], walls), shoot_dir)
 
-        return self._wander(walls), shoot_dir
+        return self._ret(self._wander(walls), shoot_dir)
 
     def _innocent_dir(self, all_players, walls, dropped_gun_pos, bucks):
         bot = self.bot
@@ -277,12 +282,12 @@ class BotBrain:
                 dx, dy = _norm(bot.x - threat.x, bot.y - threat.y)
                 if random.random() < 0.02:
                     self.reaction_delay = random.randint(5, 18)
-                return self.steer_clear_of_walls(dx, dy, walls), None
+                return self._ret(self.steer_clear_of_walls(dx, dy, walls))
 
         if dropped_gun_pos and not bot.has_gun:
             gx, gy = dropped_gun_pos
             if _dist(bot.x, bot.y, gx, gy) < 180:
-                return self._toward_point(gx, gy, walls), None
+                return self._ret(self._toward_point(gx, gy, walls))
 
         if self.group_target_id:
             buddy = next(
@@ -292,14 +297,14 @@ class BotBrain:
             if buddy:
                 d = _dist(bot.x, bot.y, buddy.x, buddy.y)
                 if d > 50:
-                    return self._toward_point(buddy.x, buddy.y, walls), None
+                    return self._ret(self._toward_point(buddy.x, buddy.y, walls))
                 if d < 35:
                     self.group_target_id = None
 
         if bucks and random.random() < 0.4 + self.greed * 0.4:
-            return self._toward_point(bucks[0], bucks[1], walls), None
+            return self._ret(self._toward_point(bucks[0], bucks[1], walls))
 
-        return self._wander(walls), None
+        return self._ret(self._wander(walls))
 
     def _toward_point(self, tx, ty, walls):
         dx, dy = _norm(tx - self.bot.x, ty - self.bot.y)
@@ -324,7 +329,11 @@ class BotBrain:
         bot = self.bot
         best = None
         best_d = 9999
-        for bx, by, _ in bucks:
+        for item in bucks:
+            if len(item) >= 2:
+                bx, by = item[0], item[1]
+            else:
+                continue
             d = _dist(bot.x, bot.y, bx, by)
             if d < best_d:
                 best_d = d

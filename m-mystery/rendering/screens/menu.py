@@ -21,10 +21,11 @@ TITLE_COLOR = (255, 255, 255)
 class MenuScreen:
     """Main menu with title, buttons, and a random tagline."""
 
-    def __init__(self, on_play, on_settings=None, on_quit=None):
+    def __init__(self, on_play, on_settings=None, on_quit=None, on_play_3d=None):
         self.on_play = on_play
         self.on_settings = on_settings
         self.on_quit = on_quit
+        self.on_play_3d = on_play_3d
 
         self.tagline = random.choice(TAGLINES)
         self.font_title = pygame.font.Font(None, 72)
@@ -34,9 +35,10 @@ class MenuScreen:
         btn_w, btn_h = 260, 55
         cx = 400
         self.buttons = [
-            {"rect": pygame.Rect(cx - btn_w // 2, 220, btn_w, btn_h), "label": "Play Game", "action": "play"},
-            {"rect": pygame.Rect(cx - btn_w // 2, 290, btn_w, btn_h), "label": "Settings", "action": "settings"},
-            {"rect": pygame.Rect(cx - btn_w // 2, 360, btn_w, btn_h), "label": "Quit", "action": "quit"},
+            {"rect": pygame.Rect(cx - btn_w // 2, 200, btn_w, btn_h), "label": "Play 2D", "action": "play"},
+            {"rect": pygame.Rect(cx - btn_w // 2, 265, btn_w, btn_h), "label": "Play 3D (Beta)", "action": "play3d"},
+            {"rect": pygame.Rect(cx - btn_w // 2, 330, btn_w, btn_h), "label": "Settings", "action": "settings"},
+            {"rect": pygame.Rect(cx - btn_w // 2, 395, btn_w, btn_h), "label": "Quit", "action": "quit"},
         ]
 
     def handle_events(self, events):
@@ -47,6 +49,8 @@ class MenuScreen:
                     if btn["rect"].collidepoint(mx, my):
                         if btn["action"] == "play" and self.on_play:
                             self.on_play()
+                        elif btn["action"] == "play3d" and self.on_play_3d:
+                            self.on_play_3d()
                         elif btn["action"] == "settings" and self.on_settings:
                             self.on_settings()
                         elif btn["action"] == "quit" and self.on_quit:

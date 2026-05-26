@@ -85,14 +85,9 @@ class Bot(Player):
         nearest_buck = self.brain.nearest_buck(bucks)
         buck_xy = nearest_buck
 
-        result = self.brain.choose_direction(
+        dx, dy, shoot_dir = self.brain.choose_direction(
             all_players, walls, dropped_gun_pos, buck_xy
         )
-        if len(result) == 3:
-            dx, dy, shoot_dir = result
-        else:
-            dx, dy = result
-            shoot_dir = None
 
         # Slight movement imperfection
         if random.random() < 0.08:
