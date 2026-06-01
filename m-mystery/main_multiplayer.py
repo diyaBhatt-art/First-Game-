@@ -83,7 +83,7 @@ class MultiplayerServer:
                 'collected': False
             })
     
-    async def handle_connection(self, websocket, path):
+    async def handle_connection(self, websocket, path=None):
         """Handle new player connection."""
         player_id = None
         try:
@@ -116,6 +116,9 @@ class MultiplayerServer:
                 }, exclude=[player_id])
             
             print(f"Player {username} (ID: {player_id}) connected")
+            
+            if len(self.players) >= 2 and self.game_state == 'lobby':
+                await self.start_game()
             
             # Main message loop
             async for message in websocket:
@@ -544,12 +547,12 @@ class BlockyCharacter(Entity):
 class MultiplayerGame3D:
     """Main 3D multiplayer game client with Roblox-style gameplay."""
     
-    def __init__(self, server_uri='ws://localhost:8765'):
+    def __init__(self, server_uri='ws://localhost:8765', username='Guest'):
         self.server_uri = server_uri
         self.websocket = None
         self.connected = False
         self.my_player_id = None
-        self.username = "Guest"
+        self.username = username
         
         # Game state
         self.remote_players = {}  # player_id -> BlockyCharacter
@@ -566,9 +569,8 @@ class MultiplayerGame3D:
         # Setup Ursina app
         self.app = Ursina(title='M Mystery 3D - Multiplayer', 
                          borderless=False, fullscreen=False,
-                         use_development_tools=False, 
-                         shaders=lit_with_shadows_shader)
-        window.color = color.sky
+                         use_development_tools=False)
+        window.color = color.azure
         
         # Camera setup
         self.camera_pivot = Entity()
@@ -579,8 +581,9 @@ class MultiplayerGame3D:
         self.setup_ui()
         self.setup_camera()
         
-        # Connection UI
-        self.show_connection_screen()
+        # Set username text and invoke auto-connect before app.run
+        self.username_input.text = self.username
+        invoke(self.attempt_connect, delay=1.0)
         
         self.app.run()
     
@@ -591,7 +594,7 @@ class MultiplayerGame3D:
         
         # Lighting
         AmbientLight(color=color.rgba(100, 100, 100, 100))
-        self.sun = DirectionalLight(shadows=True, rotation=(45, 45, 45))
+        self.sun = DirectionalLight(rotation=(45, 45, 45))
         
         # Ground plane (Roblox baseplate style)
         self.ground = Entity(
@@ -728,9 +731,9 @@ class MultiplayerGame3D:
         self.chat_input = InputField(
             parent=camera.ui,
             position=(-0.35, -0.45),
-            scale=(0.3, 0.05),
             visible=False
         )
+        self.chat_input.scale = (0.3, 0.05)
         
         # Connection screen
         self.conn_panel = Entity(
@@ -753,17 +756,17 @@ class MultiplayerGame3D:
         self.username_input = InputField(
             parent=camera.ui,
             position=(0, 0),
-            scale=(0.3, 0.05),
             placeholder='Enter Username'
         )
+        self.username_input.scale = (0.3, 0.05)
         
         self.server_input = InputField(
             parent=camera.ui,
             position=(0, -0.1),
-            scale=(0.3, 0.05),
             placeholder='ws://localhost:8765',
             text='ws://localhost:8765'
         )
+        self.server_input.scale = (0.3, 0.05)
         
         self.connect_button = Button(
             text='CONNECT',
@@ -1345,6 +1348,8 @@ if __name__ == '__main__':
         run_server()
     else:
         # Run as client
-        print("🎮 Starting Multiplayer Client...")
-        print("Make sure the server is running first!")
-        game = MultiplayerGame3D()
+        username = 'Guest'
+        if len(sys.argv) > 1:
+            username = sys.argv[1]
+        print(f"🎮 Starting Multiplayer Client as {username}...")
+        game = MultiplayerGame3D(username=username)

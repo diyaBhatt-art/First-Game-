@@ -1202,3 +1202,7 @@ def input(key):
 def run_game():
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
     Game3DApp().run()
+
+
+if __name__ == '__main__':
+    run_game()
