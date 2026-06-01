@@ -298,7 +298,7 @@ class Avatar3D(Entity):
         self.l_arm = _part(self, (-0.65, 1.15, 0), (0.3, 0.85, 0.3), skin, "l_arm")
         self.r_arm = _part(self, (0.65, 1.15, 0), (0.3, 0.85, 0.3), skin, "r_arm")
 
-        s = player.speed
+        s = 0.5
 
         # ── Shoes ────────────────────────────────────────────────────
         shoe_col = color.rgb(0.08, 0.08, 0.1)
@@ -546,9 +546,10 @@ class Game3DApp:
         self.map3d = None
         self.avatars = {}
         self.buck_entities = {}
-        self.bullet_entities = []
+        self.bullet_entity_map = {}
         self.gun_entity = None
         self.ui_root = None
+        self.role_panel = None
         self.hud = None
         self.human_elev = 0.0
         self.human_vy = 0.0
@@ -613,7 +614,7 @@ class Game3DApp:
         # Trees
         tree_positions = [
             (-22, 0, -22), (22, 0, -22), (-22, 0, 22), (22, 0, 22),
-            (0, 0, -36), (-36, 0, 0),
+            (0, 0, -36), (-36, 0, 0), (36, 0, 0), (0, 0, 36),
         ]
         for tp in tree_positions:
             self.env_entities.extend(create_tree(Vec3(*tp)))
@@ -944,14 +945,21 @@ class Game3DApp:
             self.gun_entity = None
 
         # Bullets
-        for ent in self.bullet_entities:
-            destroy(ent)
-        self.bullet_entities.clear()
+        active_ids = {id(b) for b in self.session.bullets if b.is_active}
         for b in self.session.bullets:
             if b.is_active:
+                bid = id(b)
                 wx, wy, wz = pixel_to_world(b.x, b.y, 0.8)
-                be = Entity(model="sphere", color=color.white, position=(wx, wy, wz), scale=0.2)
-                self.bullet_entities.append(be)
+                if bid not in self.bullet_entity_map:
+                    be = Entity(model="sphere", color=color.white, position=(wx, wy, wz), scale=0.2)
+                    self.bullet_entity_map[bid] = be
+                else:
+                    self.bullet_entity_map[bid].position = (wx, wy, wz)
+
+        for bid in list(self.bullet_entity_map.keys()):
+            if bid not in active_ids:
+                destroy(self.bullet_entity_map[bid])
+                del self.bullet_entity_map[bid]
 
         # Third-person camera
         h = self.avatars.get(self.human.id)
@@ -1043,11 +1051,15 @@ class Game3DApp:
 
         # Tick simulation
         winner = self.session.tick_simulation(time.dt)
+        for killer_name, victim_name, weapon in self.session.kill_log:
+            if self.kill_feed:
+                self.kill_feed.add(killer_name, victim_name, weapon)
+        self.session.kill_log.clear()
 
         # ── Detect knife kill (human only) ──────────────────────────────
         current_alive = {p.id for p in self.all_players if p.is_alive}
         dead_ids = prev_alive - current_alive
-        if dead_ids and self.human.has_knife and "space" in held_keys:
+        if dead_ids and self.human.has_knife and held_keys["space"]:
             victim = next((p for p in self.all_players if p.id in dead_ids), None)
             if victim:
                 d = math.hypot(self.human.x - victim.x, self.human.y - victim.y)
@@ -1055,8 +1067,6 @@ class Game3DApp:
                     wx, wy, wz = pixel_to_world(victim.x, victim.y)
                     spawn_death_particles(Vec3(wx, wy, wz))
                     self.fx.screen_shake(0.2, 0.25)
-                    if self.kill_feed:
-                        self.kill_feed.add("You", victim.name, "knife")
 
         # ── Detect gun fire ─────────────────────────────────────────────
         if prev_gun and not self.human.has_gun:
@@ -1153,9 +1163,9 @@ class Game3DApp:
         if self.kill_feed:
             self.kill_feed.clear()
 
-        for ent in self.bullet_entities:
+        for ent in self.bullet_entity_map.values():
             destroy(ent)
-        self.bullet_entities.clear()
+        self.bullet_entity_map.clear()
         if self.gun_entity:
             destroy(self.gun_entity)
             self.gun_entity = None

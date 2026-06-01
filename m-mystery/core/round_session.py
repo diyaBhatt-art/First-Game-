@@ -32,6 +32,7 @@ class RoundSession:
         self.screen_shake = {"frames_left": 0, "intensity": 6}
         self._prev_alive = {p.id: (p.x, p.y) for p in players if p.is_alive}
         self.shop_open = False
+        self.kill_log = []   # list of (killer_name, victim_name, weapon) tuples, drained each frame
 
     def _spawn_bucks(self):
         zones = self.map_data["buck_spawn_zones"]
@@ -75,6 +76,7 @@ class RoundSession:
                 p.attack_cooldown -= 1
 
         buck_positions = [(b[0], b[1]) for b in self.bucks]
+        alive_before = {p.id for p in self.players if p.is_alive}
         for p in self.players:
             if p.is_bot and p.is_alive:
                 bullet = p.update(
@@ -82,6 +84,18 @@ class RoundSession:
                 )
                 if bullet:
                     self.bullets.append(bullet)
+
+        alive_after = {p.id for p in self.players if p.is_alive}
+        for victim_id in alive_before - alive_after:
+            victim = next((x for x in self.players if x.id == victim_id), None)
+            if victim:
+                for bot in self.players:
+                    if bot.is_bot and bot.is_alive:
+                        dx = bot.x - victim.x
+                        dy = bot.y - victim.y
+                        if math.sqrt(dx * dx + dy * dy) <= 40:
+                            self.kill_log.append((bot.name, victim.name, "knife"))
+                            break
 
         self._update_bullets()
         self._check_deaths_witness()
@@ -111,7 +125,9 @@ class RoundSession:
                     nearest_dist = dist
                     nearest = p
             if nearest:
-                self.human.try_kill(nearest)
+                result = self.human.try_kill(nearest)
+                if result:
+                    self.kill_log.append((self.human.name, nearest.name, "knife"))
 
         elif self.human.has_gun:
             fire_dir = self.last_move_dir
@@ -150,6 +166,10 @@ class RoundSession:
                     if p.role == "murderer":
                         p.is_alive = False
                         print(f"[COMBAT] {p.name} was shot and killed!")
+                        bullet_role = bullet.role if hasattr(bullet, "role") else bullet.shooter_role
+                        shooter = next((x for x in self.players if x.role == bullet_role), None)
+                        shooter_name = shooter.name if shooter else "Unknown"
+                        self.kill_log.append((shooter_name, p.name, "gun"))
                     bullet.is_active = False
                     self.bullets.remove(bullet)
                     break
