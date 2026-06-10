@@ -7,8 +7,30 @@ and a polished HUD.
 Install: pip install ursina pygame
 Run:     python main_3d.py
 """
-from ursina import *
 import json, os, math, random, struct, wave
+
+# Panda3D's win-size config only accepts integers, but ursina seeds it from
+# the screen resolution using float math (retina scale factors), which trips
+# ":prc(warning): Invalid integer value for ConfigVariable win-size".  Wrap
+# loadPrcFileData before ursina imports it so win-size values are rounded.
+import panda3d.core as _p3d_core
+
+_load_prc_file_data = _p3d_core.loadPrcFileData
+
+
+def _load_prc_int_win_size(group, data):
+    if isinstance(data, str) and data.startswith("win-size"):
+        try:
+            _, w, h = data.split()
+            data = "win-size {} {}".format(int(float(w)), int(float(h)))
+        except ValueError:
+            pass
+    return _load_prc_file_data(group, data)
+
+
+_p3d_core.loadPrcFileData = _load_prc_int_win_size
+
+from ursina import *
 
 from core.player import Player
 from core.bot import Bot
@@ -18,6 +40,19 @@ from core.coords import pixel_to_world, PIXEL_SCALE
 from core.round_session import RoundSession
 
 SMOKE_TEST = os.environ.get("M3D_SMOKE") == "1"
+# Optional smoke-mode extension: kill the human mid-round so the screenshot
+# captures the death banner + spectator camera instead of normal play.
+SMOKE_DIE = os.environ.get("M3D_SMOKE_DIE") == "1"
+
+WINDOWED_SIZE = (1280, 720)
+
+# Roblox-style follow camera tuning.
+CAM_FOLLOW_DELAY = 0.35      # seconds of mouse stillness before follow engages
+CAM_FOLLOW_DEADZONE = 8.0    # degrees; don't fight micro-adjustments
+CAM_FOLLOW_GAIN = 3.0        # proportional catch-up rate, 1/s
+CAM_FOLLOW_MAX_RATE = 200.0  # deg/s cap (~3.5 rad/s)
+
+NAMETAG_VIEW_DIST = 25.0     # hide world nametags beyond this many metres
 
 
 # ── Colour helpers ──────────────────────────────────────────────────────
@@ -382,24 +417,34 @@ class ScreenEffects:
 # ── Kill feed ───────────────────────────────────────────────────────────
 
 class KillFeed:
+    MAX_ENTRIES = 5
+    TOP_Y = 0.42
+    ROW_H = 0.04
+
     def __init__(self):
         self.entries = []
 
     def add(self, killer_name, victim_name, weapon="knife"):
+        while len(self.entries) >= self.MAX_ENTRIES:
+            oldest = self.entries.pop(0)
+            destroy(oldest["text"])
         tag = "[GUN]" if weapon == "gun" else "[KNIFE]"
         col = c255(255, 196, 90) if weapon == "gun" else c255(255, 110, 110)
+        # Right-align against the actual screen edge so entries never clip,
+        # regardless of aspect ratio (fullscreen vs windowed).
+        edge = window.aspect_ratio / 2 - 0.03
         t = Text(
             parent=camera.ui,
             text=f"{killer_name}  {tag}  {victim_name}",
-            color=col, scale=0.95,
-            position=(0.74, 0.40 - len(self.entries) * 0.045),
+            color=col, scale=0.85,
+            position=(edge + 0.12, self.TOP_Y - len(self.entries) * self.ROW_H),
             origin=(0.5, 0), background=True,
         )
         try:
             t.background.color = c255(10, 12, 24, 170)
         except Exception:
             pass
-        t.animate("x", 0.62, duration=0.18, curve=curve.out_quad)
+        t.animate("x", edge, duration=0.18, curve=curve.out_quad)
         self.entries.append({"text": t, "life": 4.0})
 
     def update(self):
@@ -410,6 +455,11 @@ class KillFeed:
             if entry["life"] <= 0:
                 destroy(entry["text"])
                 self.entries.remove(entry)
+        # Slide remaining entries up into the freed slots.
+        for i, entry in enumerate(self.entries):
+            target_y = self.TOP_Y - i * self.ROW_H
+            t = entry["text"]
+            t.y += (target_y - t.y) * min(1.0, time.dt * 10)
 
     def clear(self):
         for entry in self.entries:
@@ -619,9 +669,14 @@ class Avatar3D(Entity):
         )
 
         self.nametag = Text(
-            text=player.name, parent=self, y=2.55, scale=8,
-            origin=(0, 0), color=color.white, billboard=True, background=True,
+            text=player.name, parent=self, y=2.45, scale=5.5,
+            origin=(0, 0), color=c255(240, 244, 255), billboard=True,
+            background=True,
         )
+        try:
+            self.nametag.background.color = c255(10, 14, 28, 150)
+        except AttributeError:
+            pass
 
         self.knife_entity = None
         self.gun_entity_w = None
@@ -884,6 +939,13 @@ class Game3DApp:
         self.cam_dist = 12.0
         self.mouse_sensitivity = 40
         self._cam_smooth = None
+        self._mouse_still_t = 99.0   # seconds since the mouse last turned the camera
+        self.occluders = []          # tall props that can block the camera
+
+        # Death / spectator
+        self._human_death_handled = False
+        self._spectate_focus = None
+        self.death_banner = None
 
         # Effects / audio
         self.fx = None
@@ -991,9 +1053,18 @@ class Game3DApp:
         for tx, tz, s in tree_spots:
             self.env_entities.extend(create_tree(Vec3(tx, 0, tz), s))
 
-        # Lampposts along the paths, kept clear of the spawn points.
+        # Lampposts along the paths, kept clear of the spawn points.  They are
+        # the only tall props inside the playfield, so register them as camera
+        # occluders: when one sits between the camera and the character it is
+        # faded out instead of blocking the view.
         for lx, lz in ((18, 10), (35, 10), (18, 30), (35, 30), (8, 20), (mw - 8, 20)):
-            self.env_entities.extend(create_lamppost(Vec3(lx, 0, lz)))
+            parts = create_lamppost(Vec3(lx, 0, lz))
+            self.env_entities.extend(parts)
+            tall_parts = [(e, e.alpha) for e in parts if e.y > 0.5]
+            self.occluders.append({
+                "x": lx, "z": lz, "radius": 0.7, "height": 4.4,
+                "parts": tall_parts, "fade": 1.0,
+            })
 
         # Barrels and rocks tucked near walls / corners.
         for bx, bz in ((14.6, 8.2), (15.4, 9.6), (38.0, 33.5), (3.4, 36.4)):
@@ -1023,13 +1094,27 @@ class Game3DApp:
 
     def run(self):
         ensure_sound_files()
+        # Launch true fullscreen by default; smoke mode stays windowed so the
+        # automated screenshot has a stable, known size.
         self.app = Ursina(
             title="M Mystery 3D",
             borderless=False,
-            fullscreen=False,
+            fullscreen=not SMOKE_TEST,
             development_mode=False,
         )
-        window.size = (1280, 720)
+        # Pin the windowed fallback to exact ints: Panda3D's win-size config
+        # rejects floats and ursina derives a float default on retina screens.
+        window.windowed_size = Vec2(*WINDOWED_SIZE)
+        window.windowed_position = None  # centre on screen when leaving fullscreen
+        if SMOKE_TEST:
+            window.size = Vec2(*WINDOWED_SIZE)
+        # ursina's hidden debug entity also binds F11; disable it so our own
+        # F11 toggle (with the forced 1280x720 windowed size) is the only one.
+        if getattr(window, "input_entity", None):
+            window.input_entity.enabled = False
+        # Render text at a higher pixel density so HUD/nametag glyphs stay
+        # crisp instead of chunky when scaled.
+        Text.default_resolution = 1080 * Text.size * 4
         window.color = c255(150, 205, 250)
         window.fps_counter.enabled = True
 
@@ -1057,6 +1142,9 @@ class Game3DApp:
         elif t > 6.5 and not self._smoke_shot_done and self.state in ("playing", "end"):
             self._smoke_shot_done = True
             self._smoke_screenshot()
+        if SMOKE_DIE and self.state == "playing" and self.human.is_alive and t > 4.0:
+            print("[SMOKE] forcing human death to exercise the spectator path")
+            self.human.is_alive = False
         if t > 8.0:
             application.quit()
 
@@ -1240,6 +1328,10 @@ class Game3DApp:
         self.cam_yaw = 0
         self.cam_pitch = 20
         self._cam_smooth = None
+        self._mouse_still_t = 99.0
+        self._human_death_handled = False
+        self._spectate_focus = None
+        self.death_banner = None
 
         self._prev_human_gun = self.human.has_gun
         self._prev_human_bucks = 0
@@ -1255,20 +1347,27 @@ class Game3DApp:
 
     def _build_hud(self):
         self.hud_root = Entity(parent=camera.ui)
+        # Anchor side widgets to the actual screen edges so the layout holds
+        # at any aspect ratio (fullscreen 16:10 retina vs windowed 16:9).
+        hw = window.aspect_ratio / 2
+        chip_x = -hw + 0.15
+        coin_x = -hw + 0.13
+        stam_x = hw - 0.14
 
         # Role chip (top-left).
         rc = ROLE_COLORS.get(self.human.role, (200, 200, 200))
         Entity(parent=self.hud_root, model="quad",
-               color=c255(14, 18, 38, 200), scale=(0.24, 0.1), position=(-0.72, 0.43))
+               color=c255(14, 18, 38, 200), scale=(0.24, 0.1), position=(chip_x, 0.43))
         Entity(parent=self.hud_root, model="quad",
-               color=c255(rc[0], rc[1], rc[2]), scale=(0.012, 0.1), position=(-0.834, 0.43))
+               color=c255(rc[0], rc[1], rc[2]), scale=(0.012, 0.1),
+               position=(chip_x - 0.114, 0.43))
         self.role_chip_text = Text(
             parent=self.hud_root, text=self.human.role.upper(),
-            position=(-0.71, 0.45), origin=(0, 0), scale=1.1,
+            position=(chip_x + 0.01, 0.45), origin=(0, 0), scale=1.1,
             color=c255(rc[0], rc[1], rc[2]))
         self.alive_text = Text(
             parent=self.hud_root, text="ALIVE: 4",
-            position=(-0.71, 0.41), origin=(0, 0), scale=0.85, color=color.white)
+            position=(chip_x + 0.01, 0.41), origin=(0, 0), scale=0.85, color=color.white)
 
         # Timer (top-center).
         Entity(parent=self.hud_root, model="quad",
@@ -1279,26 +1378,26 @@ class Game3DApp:
 
         # Coin counter (bottom-left).
         Entity(parent=self.hud_root, model="quad",
-               color=c255(14, 18, 38, 200), scale=(0.2, 0.075), position=(-0.74, -0.44))
+               color=c255(14, 18, 38, 200), scale=(0.2, 0.075), position=(coin_x, -0.44))
         self.coin_icon = Entity(
             parent=self.hud_root, model="quad", texture="circle",
-            color=c255(255, 214, 60), scale=0.035, position=(-0.81, -0.44))
+            color=c255(255, 214, 60), scale=0.035, position=(coin_x - 0.07, -0.44))
         Entity(parent=self.hud_root, model="quad", texture="circle",
-               color=c255(200, 150, 30), scale=0.022, position=(-0.81, -0.44))
+               color=c255(200, 150, 30), scale=0.022, position=(coin_x - 0.07, -0.44))
         self.coin_text = Text(
             parent=self.hud_root, text="0 / 50",
-            position=(-0.71, -0.44), origin=(0, 0), scale=1.2,
+            position=(coin_x + 0.03, -0.44), origin=(0, 0), scale=1.2,
             color=c255(255, 224, 110))
 
         # Stamina bar (bottom-right).
         Text(parent=self.hud_root, text="STAMINA", scale=0.8,
-             color=c255(200, 255, 200, 220), position=(0.72, -0.41), origin=(0, 0))
+             color=c255(200, 255, 200, 220), position=(stam_x, -0.41), origin=(0, 0))
         Entity(parent=self.hud_root, model="quad",
-               color=c255(14, 18, 38, 220), scale=(0.22, 0.03), position=(0.72, -0.45))
+               color=c255(14, 18, 38, 220), scale=(0.22, 0.03), position=(stam_x, -0.45))
         self.stamina_fill = Entity(
             parent=self.hud_root, model="quad",
             color=c255(60, 210, 90), scale=(0.21, 0.022),
-            position=(0.615, -0.45), origin=(-0.5, 0))
+            position=(stam_x - 0.105, -0.45), origin=(-0.5, 0))
 
         # Crosshair + attack cooldown bar.
         self.crosshair = Entity(parent=self.hud_root)
@@ -1319,10 +1418,15 @@ class Game3DApp:
             position=(-0.033, -0.045), origin=(-0.5, 0))
 
         # Hint line.
-        Text(parent=self.hud_root,
-             text="WASD Move  -  Shift Sprint  -  Q Jump  -  LMB/Space Attack  -  Scroll Zoom",
-             position=(0, -0.48), origin=(0, 0), scale=0.75,
-             color=c255(235, 240, 255, 170))
+        hint = Text(
+            parent=self.hud_root,
+            text="WASD Move  -  Shift Sprint  -  Q Jump  -  LMB/Space Attack  -  Scroll Zoom  -  F11 Fullscreen",
+            position=(0, -0.475), origin=(0, 0), scale=0.8,
+            color=c255(235, 240, 255, 230), background=True)
+        try:
+            hint.background.color = c255(10, 14, 28, 130)
+        except AttributeError:
+            pass
 
     # ── Buck visuals ────────────────────────────────────────────────────
 
@@ -1367,18 +1471,66 @@ class Game3DApp:
             dx /= length; dy /= length
         return dx, dy
 
+    def _follow_camera_yaw(self, dx, dy):
+        """Roblox-style follow: while the player is moving and the mouse is
+        idle, swing the camera yaw toward the movement heading along the
+        shortest angular path."""
+        if (dx == 0 and dy == 0) or self._mouse_still_t < CAM_FOLLOW_DELAY:
+            return
+        heading = math.degrees(math.atan2(dx, dy))
+        diff = (heading - self.cam_yaw + 180) % 360 - 180
+        if abs(diff) <= CAM_FOLLOW_DEADZONE:
+            return
+        step = diff * min(1.0, time.dt * CAM_FOLLOW_GAIN)
+        max_step = CAM_FOLLOW_MAX_RATE * time.dt
+        step = clamp(step, -max_step, max_step)
+        self.cam_yaw += step
+
+    def _spectate_anchor(self):
+        """World point the dead camera should focus on: the murderer if still
+        alive (the round's action), otherwise the living player nearest the
+        corpse; falls back to the corpse itself."""
+        focus_p = next(
+            (p for p in self.all_players
+             if p.role == "murderer" and p.is_alive and p is not self.human),
+            None,
+        )
+        if focus_p is None:
+            living = [p for p in self.all_players if p.is_alive and p is not self.human]
+            if living:
+                focus_p = min(
+                    living,
+                    key=lambda p: math.hypot(p.x - self.human.x, p.y - self.human.y),
+                )
+        if focus_p:
+            av = self.avatars.get(focus_p.id)
+            if av:
+                return Vec3(av.x, av.y + 1.9, av.z)
+        h = self.avatars.get(self.human.id)
+        return Vec3(h.x, h.y + 1.9, h.z)
+
     def _update_camera(self):
         h = self.avatars.get(self.human.id)
         if not h:
             return
-        if not self.human.is_alive:
-            self.cam_yaw += time.dt * 12  # slow spectate orbit
 
         yr = math.radians(self.cam_yaw)
         pr = math.radians(self.cam_pitch)
         right = Vec3(math.cos(yr), 0, -math.sin(yr))
 
-        target = Vec3(h.x, h.y + 1.9, h.z) + right * 0.8
+        if self.human.is_alive:
+            self._spectate_focus = None
+            target = Vec3(h.x, h.y + 1.9, h.z) + right * 0.8
+        else:
+            # Spectator: orbit slowly while gliding the focus point from the
+            # corpse to the round's action.
+            self.cam_yaw += time.dt * 14
+            anchor = self._spectate_anchor()
+            if self._spectate_focus is None:
+                self._spectate_focus = Vec3(h.x, h.y + 1.9, h.z)
+            self._spectate_focus = lerp(
+                self._spectate_focus, anchor, min(1.0, time.dt * 2.5))
+            target = self._spectate_focus
         horiz = self.cam_dist * math.cos(pr)
         desired = Vec3(
             target.x - math.sin(yr) * horiz,
@@ -1418,6 +1570,36 @@ class Game3DApp:
             0,
         )
 
+        self._update_camera_occluders(target)
+
+    def _update_camera_occluders(self, target):
+        """Fade tall props (lampposts) that sit on the line between the camera
+        and the focused character; restore them once the line is clear.  Props
+        here have no colliders, so a cheap 2D segment/cylinder test is used
+        instead of a raycast."""
+        cam_pos = self._cam_smooth
+        if cam_pos is None:
+            return
+        hx, hy, hz = target.x, target.y, target.z
+        sx, sz = cam_pos.x - hx, cam_pos.z - hz
+        seg_len_sq = sx * sx + sz * sz
+        for occ in self.occluders:
+            blocking = False
+            if seg_len_sq > 1e-6:
+                t = ((occ["x"] - hx) * sx + (occ["z"] - hz) * sz) / seg_len_sq
+                if 0.02 < t < 0.98:
+                    px = hx + sx * t - occ["x"]
+                    pz = hz + sz * t - occ["z"]
+                    if px * px + pz * pz < occ["radius"] * occ["radius"]:
+                        line_y = hy + (cam_pos.y - hy) * t
+                        blocking = line_y < occ["height"]
+            fade_target = 0.25 if blocking else 1.0
+            fade = occ["fade"] + (fade_target - occ["fade"]) * min(1.0, time.dt * 10)
+            if abs(fade - occ["fade"]) > 0.003:
+                occ["fade"] = fade
+                for ent, base_alpha in occ["parts"]:
+                    ent.alpha = base_alpha * fade
+
     def _sync_visuals(self):
         for p in self.all_players:
             av = self.avatars.get(p.id)
@@ -1433,6 +1615,11 @@ class Game3DApp:
             av.sync_weapons()
             av.animate_walk(p.is_moving)
             av.face_movement()
+            # Cull nametags by distance so far-away tags don't pile up.
+            if av.nametag and p.is_alive:
+                dv = av.world_position - camera.world_position
+                dist_sq = dv.x * dv.x + dv.y * dv.y + dv.z * dv.z
+                av.nametag.enabled = dist_sq < NAMETAG_VIEW_DIST * NAMETAG_VIEW_DIST
             if p is self.human and av.is_alive:
                 av.shadow.y = -elev + 0.03
                 av.shadow.alpha = max(0.15, 0.37 - elev * 0.08)
@@ -1578,6 +1765,35 @@ class Game3DApp:
                 self.sounds.play("shoot", self._vol_at(b.x, b.y, 1.0))
         self._seen_bullet_ids = set(active.keys())
 
+    def _on_human_death(self):
+        """One-shot transition into the spectator experience: fade in a
+        'YOU DIED' banner and hand the camera over to the spectate orbit."""
+        self._human_death_handled = True
+        self.human_vy = 0.0
+        self.human_elev = 0.0
+        if self.crosshair:
+            self.crosshair.enabled = False
+
+        if not self.hud_root:
+            return
+        banner = Entity(parent=self.hud_root)
+        shade = Entity(
+            parent=banner, model="quad",
+            color=c255(110, 8, 18, 0), scale=(3, 0.17), position=(0, 0.18))
+        title = Text(
+            parent=banner, text="YOU DIED", scale=3.4, origin=(0, 0),
+            position=(0, 0.18), color=c255(255, 70, 70))
+        sub = Text(
+            parent=banner, text="Spectating - mouse to look, scroll to zoom",
+            scale=0.9, origin=(0, 0), position=(0, 0.10),
+            color=c255(225, 205, 210))
+        title.alpha = 0
+        sub.alpha = 0
+        shade.animate("color", c255(110, 8, 18, 120), duration=0.9, curve=curve.out_quad)
+        title.animate("alpha", 1, duration=0.9, curve=curve.out_quad)
+        sub.animate("alpha", 1, duration=1.4, curve=curve.out_quad)
+        self.death_banner = banner
+
     # ── Main update loop ────────────────────────────────────────────────
 
     def update(self):
@@ -1598,21 +1814,33 @@ class Game3DApp:
                 self.kill_feed.update()
             return
 
+        # Mouse look always wins over camera-follow; track how long the mouse
+        # has been still so follow only engages once the player stops aiming.
         if mouse.locked:
             self.cam_yaw += mouse.velocity[0] * self.mouse_sensitivity
             self.cam_pitch = clamp(
                 self.cam_pitch - mouse.velocity[1] * self.mouse_sensitivity, -8, 62)
+            if abs(mouse.velocity[0]) > 0.0006 or abs(mouse.velocity[1]) > 0.0006:
+                self._mouse_still_t = 0.0
+            else:
+                self._mouse_still_t += time.dt
+        else:
+            self._mouse_still_t += time.dt
 
-        sprinting = held_keys["shift"]
-        dx, dy = self._camera_relative_move()
-        self.session.tick_human_move(time.dt, dx, dy, sprinting)
+        # Movement and jumping only apply while the human is alive; the dead
+        # are limited to the spectator camera.
+        if self.human.is_alive:
+            sprinting = held_keys["shift"]
+            dx, dy = self._camera_relative_move()
+            self.session.tick_human_move(time.dt, dx, dy, sprinting)
+            self._follow_camera_yaw(dx, dy)
 
-        # Jump physics (jump impulse comes from input()).
-        self.human_vy -= 28 * time.dt
-        self.human_elev += self.human_vy * time.dt
-        if self.human_elev < 0:
-            self.human_elev = 0
-            self.human_vy = 0
+            # Jump physics (jump impulse comes from input()).
+            self.human_vy -= 28 * time.dt
+            self.human_elev += self.human_vy * time.dt
+            if self.human_elev < 0:
+                self.human_elev = 0
+                self.human_vy = 0
 
         prev_gun = self._prev_human_gun
         prev_bucks = self._prev_human_bucks
@@ -1621,6 +1849,9 @@ class Game3DApp:
 
         self._drain_kill_log()
         self._detect_new_bullets()
+
+        if not self.human.is_alive and not self._human_death_handled:
+            self._on_human_death()
 
         # Human fired the gun this frame (recoil handled here, sound by tracer).
         if prev_gun and not self.human.has_gun:
@@ -1706,6 +1937,7 @@ class Game3DApp:
             self.cooldown_bg = None
             self.cooldown_fill = None
             self.crosshair = None
+            self.death_banner = None
         if self.kill_feed:
             self.kill_feed.clear()
         for ent, _, _ in self.buck_entities.values():
@@ -1764,7 +1996,19 @@ class Game3DApp:
                 h_av.play_knife_swing()
             self.sounds.play("stab", 0.35)
 
+    def _toggle_fullscreen(self):
+        if window.fullscreen:
+            window.fullscreen = False
+            window.size = Vec2(*WINDOWED_SIZE)  # force exact int size
+            window.center_on_screen()
+        else:
+            window.fullscreen = True
+
     def input(self, key):
+        if key == "f11":
+            self._toggle_fullscreen()
+            return
+
         if key == "escape":
             if self.state == "playing":
                 mouse.locked = False

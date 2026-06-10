@@ -8,17 +8,26 @@ Bots act on imperfect information, like real players:
     actually seen the murderer kill someone or spotted a drawn knife.
   * The sheriff patrols points of interest, investigates bodies, and only
     chases/shoots once confident about the murderer's identity.
-  * The murderer stalks isolated victims, avoids striking in crowds, backs
-    off from anyone visibly holding the gun, and varies aggression with its
-    personality (aggression/caution/greed/accuracy from data/bots.json).
+  * The murderer commits to hunting one isolated victim at a time, closes
+    in with a knife lunge, backs off from anyone visibly holding the gun,
+    and varies aggression with its personality (aggression/caution/greed/
+    accuracy from data/bots.json).
 
 All hard knowledge flows through witness events (RoundSession calls
 ``on_witness_kill`` / ``on_spot_knife``) or soft proximity heuristics —
 bots never read another player's hidden role directly.
+
+Navigation: every destination is reached through ``_toward_point``, which
+walks straight when there is line of sight and otherwise follows an A*
+path over the cached per-map NavGrid (core/nav.py).  Local steering
+(``_steer``) probes ahead and rotates to slide along walls instead of
+pushing into them, and a stuck detector breaks the rare remaining pins.
 """
 import math
 import random
 
+from core.bullet import BULLET_SPEED
+from core.nav import get_nav_grid
 from core.player import KNIFE_RANGE
 from core.rect import has_line_of_sight, point_in_any_rect
 
@@ -30,13 +39,27 @@ BODY_DISCOVER_RADIUS = 90   # px — walking this close reveals a corpse
 
 # ── Behaviour tuning ───────────────────────────────────────────────────
 FLEE_SPRINT_MULT = 1.5      # innocents sprint this much faster fleeing a known murderer
-MURDERER_BURST_MULT = 1.35  # murderer speed burst while closing for the kill
-MURDERER_ENGAGE_RADIUS = 110  # px — knife comes out and the burst begins
+MURDERER_BURST_MULT = 1.45  # murderer speed burst while closing for the kill
+MURDERER_ENGAGE_RADIUS = 130  # px — knife comes out and the burst begins
+MURDERER_LUNGE_RANGE = 58   # px — final lunge distance before the stab
 MURDERER_STALK_DIST = 150   # px — preferred shadowing distance before engaging
-GUN_AVOID_RADIUS = 130      # px — murderer keeps away from a visible gun holder
+GUN_AVOID_RADIUS = 110      # px — murderer keeps away from a visible gun holder
 SHERIFF_KITE_DIST = 70      # px — sheriff tries not to get closer than this
 SUSPICION_FLEE_THRESHOLD = 0.55
 SHERIFF_SHOOT_CONFIDENCE = 0.75  # suspicion needed to fire without a witnessed kill
+
+# ── Hunting persistence / pacing ───────────────────────────────────────
+HUNT_COMMIT_TICKS = 600     # ~10 s locked on one victim (no target dithering)
+HUNT_FRUSTRATION_TICKS = 1100  # ~18 s without a kill -> drop crowd caution
+MURDERER_OPENING_TICKS = 360   # base "blend in" period before the first strike
+KILL_COOLOFF_TICKS = 240       # base time acting innocent after a kill
+
+# ── Navigation tuning ──────────────────────────────────────────────────
+REPATH_INTERVAL = 18        # min ticks between A* queries per bot (~3/sec)
+GOAL_DRIFT_REPATH = 45      # px the goal may move before forcing a repath
+WAYPOINT_RADIUS = 16        # px — a waypoint closer than this counts as reached
+STUCK_WINDOW = 45           # ticks between stuck checks (~0.75 s)
+STUCK_DIST = 8.0            # px — moving less than this per window = pinned
 
 
 def _dist(ax, ay, bx, by):
@@ -89,6 +112,7 @@ class BotBrain:
         self.group_target_id = None
         self.wander_goal = None
         self.buck_goal = None
+        self.hunt_target_id = None      # murderer's committed victim
 
         # 0..1 — how far the round clock has run down (fed by RoundSession).
         # The murderer takes bigger risks as time runs out.
@@ -96,6 +120,24 @@ class BotBrain:
 
         # Output channel read by Bot.update: >1 means "sprinting"
         self.move_speed_mult = 1.0
+
+        # Navigation state (NavGrid is built lazily from the walls list and
+        # cached globally per wall layout — see core/nav.py).
+        self._nav = None
+        self._nav_walls_id = None
+        self._path = []                 # remaining pixel waypoints
+        self._path_goal = None          # goal the current path was built for
+        self._repath_timer = 0
+        self._flee_goal = None
+        self._flee_timer = 0
+        self._ticks_since_kill = 0
+        self._murderer_ticks = 0
+        self._stuck_ref = None
+        self._stuck_timer = 0
+        self._unstick_dir = None
+        self._unstick_ticks = 0
+        self._aim_track = None          # (target_id, x, y, vx, vy) velocity memory
+        self._was_confident = False     # sheriff: had a confirmed target last tick
 
     # ------------------------------------------------------------------
     # Environment / lifecycle
@@ -110,6 +152,11 @@ class BotBrain:
             pois.append((z["x"] + z["w"] / 2.0, z["y"] + z["h"] / 2.0))
         if pois:
             self.pois = pois
+        # New map geometry — invalidate any cached navigation state
+        self._nav = None
+        self._nav_walls_id = None
+        self._path = []
+        self._path_goal = None
 
     def reset_round(self):
         """Clear per-round memory (suspicion, witnesses, goals)."""
@@ -128,9 +175,31 @@ class BotBrain:
         self.group_target_id = None
         self.wander_goal = None
         self.buck_goal = None
+        self.hunt_target_id = None
         self.time_pressure = 0.0
         self.move_speed_mult = 1.0
+        self._path = []
+        self._path_goal = None
+        self._repath_timer = 0
+        self._flee_goal = None
+        self._flee_timer = 0
+        self._ticks_since_kill = 0
+        self._murderer_ticks = 0
+        self._stuck_ref = None
+        self._stuck_timer = 0
+        self._unstick_dir = None
+        self._unstick_ticks = 0
+        self._aim_track = None
+        self._was_confident = False
         self.bot.knife_drawn = False
+
+    def _ensure_nav(self, walls):
+        """Build / fetch the shared NavGrid for the current wall layout."""
+        if self._nav is not None and self._nav_walls_id == id(walls):
+            return self._nav
+        self._nav = get_nav_grid(self.map_w, self.map_h, walls)
+        self._nav_walls_id = id(walls)
+        return self._nav
 
     # ------------------------------------------------------------------
     # Witness events (called by RoundSession / game_screen)
@@ -240,11 +309,43 @@ class BotBrain:
         if self.panic_ticks > 0:
             self.panic_ticks -= 1
 
+        self._tick_stuck()
+
         # Innocents cluster: pick a "buddy" to follow sometimes
         if bot.role != "murderer" and random.random() < 0.002:
             others = [p for p in alive if p.id != bot.id]
             if others:
                 self.group_target_id = random.choice(others).id
+
+    def _tick_stuck(self):
+        """Detect a bot pinned against geometry and break it free."""
+        bot = self.bot
+        if self._unstick_ticks > 0:
+            self._unstick_ticks -= 1
+        if self.idle_until > 0 or self.reaction_delay > 0:
+            # Standing still on purpose — not stuck
+            self._stuck_ref = (bot.x, bot.y)
+            self._stuck_timer = 0
+            return
+        if self._stuck_ref is None:
+            self._stuck_ref = (bot.x, bot.y)
+            self._stuck_timer = 0
+            return
+        self._stuck_timer += 1
+        if self._stuck_timer < STUCK_WINDOW:
+            return
+        if _dist(bot.x, bot.y, self._stuck_ref[0], self._stuck_ref[1]) < STUCK_DIST:
+            # Pinned: throw away cached goals/paths and sidestep randomly
+            self._path = []
+            self._path_goal = None
+            self._repath_timer = 0
+            self.wander_goal = None
+            self._flee_goal = None
+            ang = random.uniform(0, 2 * math.pi)
+            self._unstick_dir = (math.cos(ang), math.sin(ang))
+            self._unstick_ticks = 14
+        self._stuck_ref = (bot.x, bot.y)
+        self._stuck_timer = 0
 
     def _raise_suspicion(self, pid, amount):
         self.suspicious[pid] = min(1.0, self.suspicious.get(pid, 0) + amount)
@@ -291,7 +392,7 @@ class BotBrain:
         return candidates[0][1]
 
     # ------------------------------------------------------------------
-    # Steering helpers
+    # Steering / navigation helpers
     # ------------------------------------------------------------------
 
     def _ret(self, direction, shoot_dir=None):
@@ -299,27 +400,123 @@ class BotBrain:
         dx, dy = direction
         return dx, dy, shoot_dir
 
-    def steer_clear_of_walls(self, dx, dy, walls, probe=28):
-        """Nudge direction away from nearby walls."""
+    def _probe_clear(self, dx, dy, probe, walls):
+        """True if walking *probe* px along (dx, dy) stays out of walls."""
         bot = self.bot
-        px, py = bot.x, bot.y
-        for angle in (0, 0.6, -0.6, 1.2, -1.2):
-            ca, sa = math.cos(angle), math.sin(angle)
+        for t in (0.5, 1.0):
+            px = bot.x + dx * probe * t
+            py = bot.y + dy * probe * t
+            if point_in_any_rect(px, py, walls, margin=10):
+                return False
+        return True
+
+    def _steer(self, dx, dy, walls, probe=26):
+        """Probe ahead; when blocked, rotate to the nearest clear heading.
+
+        This makes bots slide along walls instead of pushing into them.
+        """
+        dx, dy = _norm(dx, dy)
+        if dx == 0 and dy == 0:
+            return 0.0, 0.0
+        if self._probe_clear(dx, dy, probe, walls):
+            return dx, dy
+        for ang in (0.45, -0.45, 0.9, -0.9, 1.4, -1.4, 2.0, -2.0, 2.6, -2.6):
+            ca, sa = math.cos(ang), math.sin(ang)
             rdx = dx * ca - dy * sa
             rdy = dx * sa + dy * ca
-            tx, ty = px + rdx * probe, py + rdy * probe
-            if point_in_any_rect(tx, ty, walls, margin=10):
-                dx -= rdx * 0.35
-                dy -= rdy * 0.35
-        return _norm(dx, dy)
+            if self._probe_clear(rdx, rdy, probe, walls):
+                return rdx, rdy
+        return -dx, -dy
+
+    def steer_clear_of_walls(self, dx, dy, walls, probe=28):
+        """Back-compat wrapper around the probe-and-slide steering."""
+        return self._steer(dx, dy, walls, probe)
 
     def _toward_point(self, tx, ty, walls):
-        dx, dy = _norm(tx - self.bot.x, ty - self.bot.y)
-        return self.steer_clear_of_walls(dx, dy, walls)
+        """Head to (tx, ty): straight when visible, A* path when not."""
+        bot = self.bot
+        if self._repath_timer > 0:
+            self._repath_timer -= 1
+
+        # Straight shot available — drop the path and walk direct.
+        if has_line_of_sight(bot.x, bot.y, tx, ty, walls, step=10.0):
+            self._path = []
+            self._path_goal = None
+            return self._steer(tx - bot.x, ty - bot.y, walls)
+
+        goal_moved = (
+            self._path_goal is None
+            or _dist(self._path_goal[0], self._path_goal[1], tx, ty)
+            > GOAL_DRIFT_REPATH
+        )
+        if goal_moved:
+            self._path = []
+        if not self._path and self._repath_timer <= 0:
+            nav = self._ensure_nav(walls)
+            self._path = nav.find_path(bot.x, bot.y, tx, ty)
+            self._path_goal = (tx, ty)
+            self._repath_timer = REPATH_INTERVAL
+
+        while self._path and _dist(
+            bot.x, bot.y, self._path[0][0], self._path[0][1]
+        ) < WAYPOINT_RADIUS:
+            self._path.pop(0)
+
+        if self._path:
+            wx, wy = self._path[0]
+            return self._steer(wx - bot.x, wy - bot.y, walls)
+        # No path yet (repath rate-limited) — steer roughly toward the goal
+        return self._steer(tx - bot.x, ty - bot.y, walls)
 
     def _away_from(self, tx, ty, walls):
-        dx, dy = _norm(self.bot.x - tx, self.bot.y - ty)
-        return self.steer_clear_of_walls(dx, dy, walls)
+        """Local retreat: step away from a point, sliding along walls."""
+        return self._steer(self.bot.x - tx, self.bot.y - ty, walls)
+
+    def _flee_from(self, tx, ty, walls):
+        """Purposeful flight: run (pathfinding) to a refuge far from the threat."""
+        bot = self.bot
+        if self._flee_timer > 0:
+            self._flee_timer -= 1
+        goal = self._flee_goal
+        if goal is not None:
+            reached = _dist(bot.x, bot.y, goal[0], goal[1]) < 40
+            compromised = _dist(tx, ty, goal[0], goal[1]) < 120
+            if reached or compromised:
+                goal = None
+                self._flee_goal = None
+        if goal is None and self._flee_timer <= 0:
+            goal = self._pick_flee_goal(tx, ty)
+            self._flee_goal = goal
+            self._flee_timer = 45
+        if goal is not None:
+            return self._toward_point(goal[0], goal[1], walls)
+        return self._away_from(tx, ty, walls)
+
+    def _pick_flee_goal(self, tx, ty):
+        """Refuge point: far from the threat, not too far from the bot."""
+        bot = self.bot
+        w, h = self.map_w, self.map_h
+        candidates = list(self.pois) + [
+            (70, 70), (w - 70, 70), (70, h - 70), (w - 70, h - 70),
+            (w / 2.0, h / 2.0),
+        ]
+        best = None
+        best_score = -1e9
+        for cx, cy in candidates:
+            score = _dist(cx, cy, tx, ty) - 0.7 * _dist(cx, cy, bot.x, bot.y)
+            if score > best_score:
+                best_score = score
+                best = (cx, cy)
+        return best
+
+    def _random_open_point(self, walls):
+        """Random map point that is not inside (or hugging) a wall."""
+        for _attempt in range(12):
+            gx = random.randint(60, max(61, self.map_w - 60))
+            gy = random.randint(60, max(61, self.map_h - 60))
+            if not point_in_any_rect(gx, gy, walls, margin=24):
+                return gx, gy
+        return self.map_w / 2.0, self.map_h / 2.0
 
     def _wander(self, walls):
         """Purposeful wandering between points of interest with pauses."""
@@ -329,11 +526,9 @@ class BotBrain:
                 gx, gy = random.choice(self.pois)
                 # Don't pick the POI we're already standing on
                 if _dist(bot.x, bot.y, gx, gy) < 60:
-                    gx = random.randint(60, max(61, self.map_w - 60))
-                    gy = random.randint(60, max(61, self.map_h - 60))
+                    gx, gy = self._random_open_point(walls)
             else:
-                gx = random.randint(60, max(61, self.map_w - 60))
-                gy = random.randint(60, max(61, self.map_h - 60))
+                gx, gy = self._random_open_point(walls)
             self.wander_goal = (gx, gy)
         gx, gy = self.wander_goal
         if _dist(bot.x, bot.y, gx, gy) < 35:
@@ -376,7 +571,15 @@ class BotBrain:
             self.idle_until -= 1
             return 0, 0, None
 
-        if self.panic_ticks <= 0 and random.random() < 0.003:
+        # Breaking out of a wall pin overrides everything for a few ticks
+        if self._unstick_ticks > 0 and self._unstick_dir is not None:
+            dx, dy = self._steer(
+                self._unstick_dir[0], self._unstick_dir[1], walls
+            )
+            return dx, dy, None
+
+        if (bot.role != "murderer" and self.panic_ticks <= 0
+                and random.random() < 0.003):
             self.idle_until = random.randint(15, 45)
 
         if bot.role == "murderer":
@@ -392,6 +595,8 @@ class BotBrain:
     def _murderer_dir(self, all_players, walls, bucks):
         bot = self.bot
         bot.knife_drawn = False
+        self._ticks_since_kill += 1
+        self._murderer_ticks += 1
 
         targets = [
             p for p in all_players
@@ -400,82 +605,146 @@ class BotBrain:
         if not targets:
             return self._ret(self._wander(walls))
 
-        # Back off from anyone visibly carrying the gun. This is a steering
-        # response, not a hard flee — and as the clock runs down the
-        # murderer accepts the risk (timer expiry means losing anyway).
-        avoid_r = (GUN_AVOID_RADIUS + self.caution * 60) * (1.0 - 0.6 * self.time_pressure)
-        for armed in targets:
-            if not getattr(armed, "has_gun", False):
-                continue
-            d = _dist(bot.x, bot.y, armed.x, armed.y)
-            if d < avoid_r and has_line_of_sight(bot.x, bot.y, armed.x, armed.y, walls):
-                return self._ret(self._away_from(armed.x, armed.y, walls))
-
         # Cool off (act innocent) right after a kill or a gun scare
         if self.retreat_ticks > 0:
             self.retreat_ticks -= 1
             if self.retreat_from:
-                return self._ret(self._away_from(self.retreat_from[0],
-                                                 self.retreat_from[1], walls))
+                return self._ret(self._flee_from(
+                    self.retreat_from[0], self.retreat_from[1], walls))
             return self._ret(self._wander(walls))
 
-        # Pick the most isolated victim (MM2-style stalking)
+        # Desperation: a long dry spell or the clock running down overrides
+        # caution — timer expiry means the murderer loses anyway.
+        desperate = (
+            self.time_pressure > 0.55
+            or self._ticks_since_kill > HUNT_FRUSTRATION_TICKS
+            or len(targets) == 1
+        )
+
+        # Stay committed to one victim instead of dithering between targets
+        target = None
+        if self.hunt_target_id is not None and self.commit_ticks > 0:
+            target = next(
+                (p for p in targets if p.id == self.hunt_target_id), None)
+        if self.commit_ticks > 0:
+            self.commit_ticks -= 1
+        if target is None:
+            target = self._pick_victim(targets)
+            self.hunt_target_id = target.id
+            self.commit_ticks = HUNT_COMMIT_TICKS
+
+        d = _dist(bot.x, bot.y, target.x, target.y)
+        engage_r = MURDERER_ENGAGE_RADIUS + self.aggression * 40
+
+        # Back off from a visible gun holder — unless desperate or already
+        # closing on the victim (committed to the kill).
+        if not desperate and d > engage_r * 0.6:
+            avoid_r = (
+                (GUN_AVOID_RADIUS + self.caution * 50)
+                * (1.0 - 0.6 * self.time_pressure)
+            )
+            for armed in targets:
+                if not getattr(armed, "has_gun", False):
+                    continue
+                ad = _dist(bot.x, bot.y, armed.x, armed.y)
+                if ad < avoid_r and has_line_of_sight(
+                        bot.x, bot.y, armed.x, armed.y, walls):
+                    return self._ret(self._flee_from(armed.x, armed.y, walls))
+
+        # Crowd discipline: aggressive personalities tolerate one witness,
+        # cautious ones want the victim completely alone. Risk tolerance
+        # climbs as the clock runs out; desperation drops the act entirely.
+        witnesses = sum(
+            1 for p in targets
+            if p is not target and _dist(target.x, target.y, p.x, p.y) < 130
+        )
+        crowd_limit = 1 if self.aggression >= 0.7 else 0
+        if self.time_pressure > 0.5:
+            crowd_limit += 1
+        if self.time_pressure > 0.8:
+            crowd_limit += 2  # desperate endgame: attack regrouped survivors
+        engage = desperate or witnesses <= crowd_limit
+
+        # Opening act: blend in for a while before the first strike so the
+        # round breathes (cautious personalities wait longer).
+        opening = MURDERER_OPENING_TICKS * (0.6 + self.caution * 1.4)
+        if (not desperate and self._ticks_since_kill == self._murderer_ticks
+                and self._murderer_ticks < opening):
+            engage = False
+
+        if engage:
+            if d <= engage_r:
+                # Knife out, burst in for the kill
+                bot.knife_drawn = True
+                self.move_speed_mult = MURDERER_BURST_MULT
+                if (d <= MURDERER_LUNGE_RANGE
+                        and bot.attack_cooldown <= 0
+                        and has_line_of_sight(
+                            bot.x, bot.y, target.x, target.y, walls)):
+                    self._lunge(target, walls)
+                    if bot.try_kill(target):
+                        bot.knife_drawn = False
+                        self.move_speed_mult = 1.0
+                        self.hunt_target_id = None
+                        self.commit_ticks = 0
+                        self._ticks_since_kill = 0
+                        # Slip away from the body — but linger less when the
+                        # clock (or an aggressive streak) demands more kills.
+                        cooloff = (KILL_COOLOFF_TICKS
+                                   + int((1 - self.aggression) * 240))
+                        self.retreat_ticks = int(
+                            cooloff * (1.0 - 0.7 * self.time_pressure))
+                        self.retreat_from = (target.x, target.y)
+                        return self._ret(self._flee_from(
+                            target.x, target.y, walls))
+                # Serpentine while charging: a straight burst is free food
+                # for a leading sheriff shot.
+                if d > MURDERER_LUNGE_RANGE:
+                    dx, dy = self._toward_point(target.x, target.y, walls)
+                    weave = 0.45 * math.sin(self._murderer_ticks * 0.18)
+                    return self._ret(_norm(dx - dy * weave, dy + dx * weave))
+            return self._ret(self._toward_point(target.x, target.y, walls))
+
+        # Too many witnesses: shadow the target from a distance and blend in
+        if d > MURDERER_STALK_DIST + 40:
+            return self._ret(self._toward_point(target.x, target.y, walls))
+        if d < MURDERER_STALK_DIST - 30:
+            return self._ret(self._away_from(target.x, target.y, walls))
+        if bucks and random.random() < 0.4 * (1 - self.aggression):
+            return self._ret(self._toward_point(bucks[0], bucks[1], walls))
+        return self._ret(self._wander(walls))
+
+    def _pick_victim(self, targets):
+        """Most isolated victim, preferring nearby ones (MM2-style stalking)."""
+        bot = self.bot
         best = None
         best_score = -1e9
-        best_witnesses = 0
         for t in targets:
             d = _dist(bot.x, bot.y, t.x, t.y)
             nearby_allies = sum(
                 1 for p in targets
                 if p is not t and _dist(t.x, t.y, p.x, p.y) < 130
             )
-            isolation = max(0, 3 - nearby_allies)
-            score = isolation * 40 - d * 0.25 + self.aggression * 30
+            score = max(0, 3 - nearby_allies) * 40 - d * 0.3
             if d <= KNIFE_RANGE:
                 score += 200
             if score > best_score:
                 best_score = score
                 best = t
-                best_witnesses = nearby_allies
+        return best
 
-        d = _dist(bot.x, bot.y, best.x, best.y)
-
-        # Crowd discipline: aggressive personalities tolerate one witness,
-        # cautious ones want the victim completely alone. With only one
-        # target left there is nothing to wait for, and as the clock runs
-        # out the murderer loses (timer expiry = innocents win), so risk
-        # tolerance climbs with time pressure.
-        crowd_limit = 1 if self.aggression >= 0.7 else 0
-        if self.time_pressure > 0.5:
-            crowd_limit += 1
-        if self.time_pressure > 0.8:
-            crowd_limit += 2  # desperate endgame: attack regrouped survivors
-        engage = best_witnesses <= crowd_limit or len(targets) == 1
-
-        if engage:
-            if d <= MURDERER_ENGAGE_RADIUS:
-                # Knife out, burst in for the kill
-                bot.knife_drawn = True
-                self.move_speed_mult = MURDERER_BURST_MULT
-                if d <= KNIFE_RANGE and bot.try_kill(best):
-                    bot.knife_drawn = False
-                    self.move_speed_mult = 1.0
-                    # Slip away from the body — but linger less when the
-                    # clock (or an aggressive streak) demands more kills.
-                    cooloff = 70 + int((1 - self.aggression) * 60)
-                    self.retreat_ticks = int(cooloff * (1.0 - 0.6 * self.time_pressure))
-                    self.retreat_from = (best.x, best.y)
-                    return self._ret(self._away_from(best.x, best.y, walls))
-            return self._ret(self._toward_point(best.x, best.y, walls))
-
-        # Too many witnesses: shadow the target from a distance and blend in
-        if d > MURDERER_STALK_DIST + 40:
-            return self._ret(self._toward_point(best.x, best.y, walls))
-        if d < MURDERER_STALK_DIST - 30:
-            return self._ret(self._away_from(best.x, best.y, walls))
-        if bucks and random.random() < 0.4 * (1 - self.aggression):
-            return self._ret(self._toward_point(bucks[0], bucks[1], walls))
-        return self._ret(self._wander(walls))
+    def _lunge(self, target, walls):
+        """Close the last few pixels for the stab (mirrors the human lunge)."""
+        bot = self.bot
+        d = _dist(bot.x, bot.y, target.x, target.y)
+        if d <= KNIFE_RANGE:
+            return
+        ndx, ndy = _norm(target.x - bot.x, target.y - bot.y)
+        remaining = d - KNIFE_RANGE + 2
+        while remaining > 0:
+            step = min(8.0, remaining)
+            bot.move(ndx * step, ndy * step, walls)
+            remaining -= step
 
     # ------------------------------------------------------------------
     # Sheriff
@@ -499,13 +768,23 @@ class BotBrain:
             else:
                 target = suspect  # low confidence — track but don't shoot
 
+        if target is not None:
+            self._track_target_velocity(target)
+
+        # Newly confident: a "draw and aim" beat before the first shot
+        if confident and not self._was_confident:
+            self.action_cooldown = max(self.action_cooldown,
+                                       random.randint(15, 30))
+        self._was_confident = confident
+
         if bot.has_gun and target:
             d = _dist(bot.x, bot.y, target.x, target.y)
             los = has_line_of_sight(bot.x, bot.y, target.x, target.y, walls)
-            if confident and los and d <= bot.shoot_range and self.action_cooldown <= 0:
-                self.action_cooldown = random.randint(25, 50)
-                if random.random() < self.accuracy:
-                    shoot_dir = _norm(target.x - bot.x, target.y - bot.y)
+            if (confident and los and d <= bot.shoot_range
+                    and self.action_cooldown <= 0
+                    and self._clear_shot(target, all_players)):
+                self.action_cooldown = random.randint(30, 55)
+                shoot_dir = self._aim_at(target)
             if confident:
                 # Chase, but kite: keep out of knife range
                 self.move_speed_mult = 1.2
@@ -517,9 +796,9 @@ class BotBrain:
                                      shoot_dir)
                 # In the pocket — strafe sideways while lining up the shot
                 fx, fy = _norm(target.x - bot.x, target.y - bot.y)
-                side = 1 if (id(target) % 2 == 0) else -1
+                side = 1 if (sum(ord(c) for c in target.id) % 2 == 0) else -1
                 return self._ret(
-                    self.steer_clear_of_walls(-fy * side, fx * side, walls),
+                    self._steer(-fy * side, fx * side, walls),
                     shoot_dir,
                 )
             # Unconfirmed suspect close by: hold ground / back up warily
@@ -540,7 +819,7 @@ class BotBrain:
                 d = _dist(bot.x, bot.y, threat.x, threat.y)
                 if d < bot.flee_range + self.caution * 60:
                     self.move_speed_mult = FLEE_SPRINT_MULT
-                    return self._ret(self._away_from(threat.x, threat.y, walls))
+                    return self._ret(self._flee_from(threat.x, threat.y, walls))
 
         # Investigate the nearest unexamined body
         body = self._nearest_unexamined_body()
@@ -557,6 +836,74 @@ class BotBrain:
             return self._ret(self._toward_point(bucks[0], bucks[1], walls), shoot_dir)
 
         return self._ret(self._wander(walls), shoot_dir)
+
+    def _track_target_velocity(self, target):
+        """Per-tick velocity estimate of the shoot target (EMA-smoothed).
+
+        ``facing`` flickers with steering and ignores sprint bursts, so the
+        sheriff remembers where the target actually moved instead.
+        """
+        track = self._aim_track
+        if track is None or track[0] != target.id:
+            self._aim_track = (target.id, target.x, target.y, 0.0, 0.0)
+            return
+        _tid, px, py, vx, vy = track
+        nvx = 0.65 * vx + 0.35 * (target.x - px)
+        nvy = 0.65 * vy + 0.35 * (target.y - py)
+        self._aim_track = (target.id, target.x, target.y, nvx, nvy)
+
+    def _aim_at(self, target):
+        """Intercept aim: fire where the target will be, with skill jitter."""
+        bot = self.bot
+        rx, ry = target.x - bot.x, target.y - bot.y
+        vx, vy = 0.0, 0.0
+        track = self._aim_track
+        if track is not None and track[0] == target.id:
+            vx, vy = track[3], track[4]
+
+        # Solve |R + V t| = BULLET_SPEED * t for the flight time t (frames)
+        s2 = float(BULLET_SPEED * BULLET_SPEED)
+        a = vx * vx + vy * vy - s2
+        b = 2.0 * (rx * vx + ry * vy)
+        c = rx * rx + ry * ry
+        t = None
+        if abs(a) > 1e-6:
+            disc = b * b - 4.0 * a * c
+            if disc >= 0:
+                root = math.sqrt(disc)
+                for cand in ((-b - root) / (2.0 * a), (-b + root) / (2.0 * a)):
+                    if cand > 0 and (t is None or cand < t):
+                        t = cand
+        if t is None:
+            t = math.sqrt(c) / float(BULLET_SPEED)
+
+        ax, ay = rx + vx * t, ry + vy * t
+        ang = math.atan2(ay, ax)
+        ang += random.gauss(0.0, 0.03 + 0.18 * (1.0 - self.accuracy))
+        return math.cos(ang), math.sin(ang)
+
+    def _clear_shot(self, target, all_players):
+        """True if no bystander stands near the firing line.
+
+        A bullet stopped by a non-murderer is wasted (the gun drops where
+        it lands), so the sheriff holds fire instead of spraying.
+        """
+        bot = self.bot
+        sx, sy = target.x - bot.x, target.y - bot.y
+        seg_len = math.sqrt(sx * sx + sy * sy)
+        if seg_len < 1.0:
+            return True
+        ux, uy = sx / seg_len, sy / seg_len
+        for p in all_players:
+            if p is bot or p is target or not p.is_alive:
+                continue
+            px, py = p.x - bot.x, p.y - bot.y
+            along = px * ux + py * uy
+            if along < 0 or along > seg_len:
+                continue
+            if abs(px * uy - py * ux) < 18:
+                return False
+        return True
 
     def _nearest_unexamined_body(self):
         bot = self.bot
@@ -578,22 +925,14 @@ class BotBrain:
     def _innocent_dir(self, all_players, walls, dropped_gun_pos, bucks):
         bot = self.bot
 
-        # 1) Known murderer → sprint away, drifting toward other survivors
+        # 1) Known murderer → sprint to a refuge on the far side of the map
         known = self.known_murderer(all_players)
         if known:
             d = _dist(bot.x, bot.y, known.x, known.y)
             flee_dist = bot.flee_range + self.caution * 70
             if d < flee_dist:
                 self.move_speed_mult = FLEE_SPRINT_MULT
-                fx, fy = _norm(bot.x - known.x, bot.y - known.y)
-                ally = self._nearest_survivor(all_players, exclude_id=known.id)
-                if ally:
-                    ax, ay = _norm(ally.x - bot.x, ally.y - bot.y)
-                    # Only blend toward the ally if that doesn't run us
-                    # back into the murderer
-                    if ax * fx + ay * fy > -0.2:
-                        fx, fy = _norm(fx * 0.65 + ax * 0.35, fy * 0.65 + ay * 0.35)
-                return self._ret(self.steer_clear_of_walls(fx, fy, walls))
+                return self._ret(self._flee_from(known.x, known.y, walls))
             # Out of immediate danger: regroup with the nearest survivor
             ally = self._nearest_survivor(all_players, exclude_id=known.id)
             if ally and _dist(bot.x, bot.y, ally.x, ally.y) > 70:

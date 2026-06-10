@@ -251,12 +251,18 @@ class RoundSession:
                 self.bullets.remove(bullet)
                 continue
 
+            shooter_id = getattr(bullet, "shooter_id", None)
             for p in self.players:
-                if not p.is_alive:
+                # A bullet can never hit its own shooter — it spawns at the
+                # shooter's position, so without this check every shot was
+                # "stopped" by the shooter on its very first frame.
+                if not p.is_alive or p.id == shooter_id:
                     continue
-                dx = bullet.x - p.x
-                dy = bullet.y - p.y
-                if math.sqrt(dx * dx + dy * dy) < 15:
+                # Distance from the player to the bullet's travel segment
+                # this frame — a fast bullet can otherwise step past a
+                # player between two frames.
+                if self._segment_point_dist(
+                        prev_x, prev_y, bullet.x, bullet.y, p.x, p.y) < 15:
                     if p.role == "murderer":
                         p.is_alive = False
                         p.last_killer_id = getattr(bullet, "shooter_id", None)
@@ -272,6 +278,18 @@ class RoundSession:
                     bullet.is_active = False
                     self.bullets.remove(bullet)
                     break
+
+    @staticmethod
+    def _segment_point_dist(x1, y1, x2, y2, px, py):
+        """Shortest distance from point (px, py) to segment (x1,y1)-(x2,y2)."""
+        sx, sy = x2 - x1, y2 - y1
+        seg_sq = sx * sx + sy * sy
+        if seg_sq < 1e-9:
+            return math.sqrt((px - x1) ** 2 + (py - y1) ** 2)
+        t = ((px - x1) * sx + (py - y1) * sy) / seg_sq
+        t = max(0.0, min(1.0, t))
+        cx, cy = x1 + sx * t, y1 + sy * t
+        return math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
 
     def _drop_spent_gun(self, x, y):
         """Re-drop the gun where a missed bullet landed (MM2-style recovery).

@@ -4,11 +4,21 @@ Builds the standard 1 human + 3 bots roster (mirrors main.py), loads
 data/maps/map_01.json, and runs RoundSession tick-by-tick at dt=1/60 with
 the human idle, for up to 3 simulated rounds.
 
+Because the human idles, a bot is always forced to be the murderer so the
+rounds can actually resolve. The three-round run asserts that:
+  * at least 2 of 3 rounds end decisively BEFORE the timer expires,
+  * at least 2 kills happen across the rounds,
+  * bots keep moving (average displacement per second above a floor, and
+    never more than ~3 consecutive near-stationary seconds — i.e. no bot
+    grinds against a wall),
+  * the frozen Player/Bot/RoundSession API surface is intact.
+
 Run:
     "/Users/aritro/Downloads/Diya-Sonu Game/venv/bin/python" tests/test_core_sim.py
 Also works under pytest.
 """
 import json
+import math
 import os
 import random
 import sys
@@ -136,10 +146,30 @@ def gun_economy_count(session):
 # Full-round simulation
 # ─────────────────────────────────────────────────────────────────────────
 
+# Movement-health thresholds (the human idles; these apply to bots only).
+MIN_AVG_DISPLACEMENT = 25.0   # px per second, averaged over the round
+MAX_STUCK_SECONDS = 3         # max consecutive seconds moving < STUCK_EPS px
+STUCK_EPS = 6.0
+
+
+def force_bot_murderer(all_players, human):
+    """The human idles in these tests, so a bot must carry the knife."""
+    if human.role != "murderer":
+        return
+    bot = random.choice([p for p in all_players if p.is_bot])
+    human.role = bot.role
+    human.has_knife = bot.has_knife
+    human.has_gun = bot.has_gun
+    bot.role = "murderer"
+    bot.has_knife = True
+    bot.has_gun = False
+
+
 def run_round(all_players, human, map_data, wallet, seed):
     random.seed(seed)
     reset_players(all_players, map_data["spawn_points"])
     assign_roles(all_players)
+    force_bot_murderer(all_players, human)
     session = RoundSession(all_players, map_data, wallet, human)
 
     # Bucks must never spawn inside a wall
@@ -158,9 +188,22 @@ def run_round(all_players, human, map_data, wallet, seed):
     kill_entries = []
     names = {p.name for p in all_players}
 
-    for tick in range(max_ticks):
+    bots = [p for p in all_players if p.is_bot]
+    last_pos = {p.id: (p.x, p.y) for p in bots}
+    displacements = {p.id: [] for p in bots}  # px moved in each alive second
+
+    for tick in range(1, max_ticks + 1):
         session.tick_human_move(DT, 0, 0, False)  # human idles
         winner = session.tick_simulation(DT)
+
+        # Sample bot movement once per simulated second
+        if tick % 60 == 0:
+            for p in bots:
+                lx, ly = last_pos[p.id]
+                if p.is_alive:
+                    displacements[p.id].append(
+                        math.hypot(p.x - lx, p.y - ly))
+                last_pos[p.id] = (p.x, p.y)
 
         # Drain the kill feed like the frontends do
         for entry in session.kill_log:
@@ -197,11 +240,29 @@ def run_round(all_players, human, map_data, wallet, seed):
         "kill feed (%d entries) does not match deaths (%d)"
         % (len(kill_entries), len(dead)))
 
+    # --- Movement health: bots never grind against walls -----------------
+    for p in bots:
+        samples = displacements[p.id]
+        if len(samples) < 3:
+            continue  # died almost immediately — too little data to judge
+        avg = sum(samples) / len(samples)
+        assert avg >= MIN_AVG_DISPLACEMENT, (
+            "bot %s barely moved (avg %.1f px/s < %.1f) — stuck on walls?"
+            % (p.name, avg, MIN_AVG_DISPLACEMENT))
+        stuck_run = 0
+        for d in samples:
+            stuck_run = stuck_run + 1 if d < STUCK_EPS else 0
+            assert stuck_run <= MAX_STUCK_SECONDS, (
+                "bot %s stood still / pushed a wall for >%d consecutive "
+                "seconds" % (p.name, MAX_STUCK_SECONDS))
+
+    decisive = session.round_manager.remaining > 0.5
+
     bot_bucks = sum(p.m_bucks_this_round for p in all_players if p.is_bot)
     for p in all_players:
         wallet.add_round_earnings(p.id, p.m_bucks_this_round)
     wallet.save()
-    return winner, kill_entries, bot_bucks
+    return winner, kill_entries, bot_bucks, decisive
 
 
 def test_three_rounds():
@@ -211,17 +272,30 @@ def test_three_rounds():
     wallet = currency.WalletManager()
 
     total_bot_bucks = 0
+    total_kills = 0
+    decisive_rounds = 0
     winners = []
     for rnd, seed in enumerate((7, 8, 9), start=1):
-        winner, kills, bot_bucks = run_round(
+        winner, kills, bot_bucks, decisive = run_round(
             all_players, human, map_data, wallet, seed)
         winners.append(winner)
         total_bot_bucks += bot_bucks
-        print("[TEST] round %d -> winner=%s kills=%s bot_bucks=%d"
-              % (rnd, winner, kills, bot_bucks))
+        total_kills += len(kills)
+        decisive_rounds += 1 if decisive else 0
+        print("[TEST] round %d -> winner=%s decisive=%s kills=%s bot_bucks=%d"
+              % (rnd, winner, decisive, kills, bot_bucks))
 
+    assert decisive_rounds >= 2, (
+        "only %d/3 rounds ended before the timer — bots too passive"
+        % decisive_rounds)
+    assert total_kills >= 2, (
+        "only %d kills across 3 rounds — murderer bot is not hunting"
+        % total_kills)
     assert total_bot_bucks > 0, "bots never collected any bucks across 3 rounds"
-    print("[TEST] winners:", winners, "| total bot bucks:", total_bot_bucks)
+    print("[TEST] winners:", winners,
+          "| decisive rounds:", decisive_rounds,
+          "| total kills:", total_kills,
+          "| total bot bucks:", total_bot_bucks)
 
 
 # ─────────────────────────────────────────────────────────────────────────
