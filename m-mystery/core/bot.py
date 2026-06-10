@@ -5,6 +5,16 @@ import random
 from core.player import Player
 from core.bot_ai import BotBrain
 
+# ── Game-feel tuning ───────────────────────────────────────────────────
+# Frames between committed direction changes (lower = twitchier).
+BOT_DECISION_INTERVAL = 6
+# While panicking (fleeing a known murderer) bots re-steer faster.
+BOT_PANIC_INTERVAL = 3
+# Bot sprint stamina economy (per frame at 60 fps): a full bar buys about
+# 3 s of sprinting and refills in roughly 5.5 s of walking.
+BOT_SPRINT_DRAIN_PER_FRAME = 0.55
+BOT_STAMINA_REGEN_PER_FRAME = 0.30
+
 
 class Bot(Player):
     """AI-controlled player with human-like utility AI."""
@@ -70,9 +80,9 @@ class Bot(Player):
                 nearest = p
         return nearest
 
-    def _set_move_dir(self, dx, dy):
+    def _set_move_dir(self, dx, dy, interval=BOT_DECISION_INTERVAL):
         self.dx, self.dy = dx, dy
-        self.ticks_left = 8
+        self.ticks_left = interval
 
     def update(self, all_players, walls, dropped_gun_pos=None, bucks=None):
         if not self.is_alive:
@@ -95,11 +105,25 @@ class Bot(Player):
         dx += math.cos(self.anim_phase) * self.move_jitter * 0.3
         dy += math.sin(self.anim_phase) * self.move_jitter * 0.3
 
-        speed = self.speed
+        # Sprint multiplier from the brain (fleeing / murder burst), paid
+        # for with the bot's own stamina bar so chases can't last forever.
+        mult = self.brain.move_speed_mult
+        if mult > 1.0:
+            if self.stamina > 0:
+                self.stamina = max(0.0, self.stamina - BOT_SPRINT_DRAIN_PER_FRAME)
+            else:
+                mult = 1.0
+        else:
+            self.stamina = min(self.max_stamina,
+                               self.stamina + BOT_STAMINA_REGEN_PER_FRAME)
+        speed = self.speed * mult
+
         if self.ticks_left > 0:
             self.ticks_left -= 1
         else:
-            self._set_move_dir(dx, dy)
+            interval = (BOT_PANIC_INTERVAL if self.brain.panic_ticks > 0
+                        else BOT_DECISION_INTERVAL)
+            self._set_move_dir(dx, dy, interval)
 
         self.move(self.dx * speed, self.dy * speed, walls)
 

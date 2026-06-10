@@ -1,10 +1,19 @@
-import pygame
 import math
 
 from core.bullet import Bullet
+from core.rect import Rect
 
+# ── Game-feel tuning ───────────────────────────────────────────────────
 # Size of the player's collision box (width and height in pixels)
 PLAYER_SIZE = 20
+
+# Knife reach for a direct stab (px). The human attack additionally gets a
+# short lunge-assist up to KNIFE_LUNGE_RANGE — see RoundSession._human_attack.
+KNIFE_RANGE = 40
+
+# Frames between knife swings (60 fps → 1.0 s). Gives victims a real window
+# to break away after a swing.
+KNIFE_COOLDOWN_FRAMES = 60
 
 
 class Player:
@@ -60,17 +69,28 @@ class Player:
         # M Bucks collected this round (resets each round, max 50)
         self.m_bucks_this_round = 0
 
+        # ── Witness / attribution state (additive) ─────────────────────
+        # True while the knife is visibly out (murderer stalking). Nearby
+        # bots that see a drawn knife learn who the murderer is.
+        self.knife_drawn = False
+        # Who killed this player (set on death; used for the kill feed and
+        # witness logic so kills are never misattributed).
+        self.last_killer_id = None
+        self.last_killer_name = None
+        self.last_death_weapon = None
+
     def get_rect(self):
-        """Return a pygame.Rect representing the player's collision box."""
+        """Return a Rect representing the player's collision box."""
         half = PLAYER_SIZE // 2
-        return pygame.Rect(self.x - half, self.y - half, PLAYER_SIZE, PLAYER_SIZE)
+        return Rect(self.x - half, self.y - half, PLAYER_SIZE, PLAYER_SIZE)
 
     def move(self, dx, dy, walls):
         """
         Move the player by (dx, dy) while colliding with wall rectangles.
 
         X and Y movement are checked separately so the player can slide
-        along walls (simple AABB collision).
+        along walls (simple AABB collision). Wall rects may be core Rect
+        or pygame.Rect objects — anything with x/y/w/h attributes.
         """
         size = PLAYER_SIZE
         half = size // 2
@@ -78,14 +98,14 @@ class Player:
         moved = False
         # --- Try moving on the X axis ---
         new_x = self.x + dx
-        test_rect = pygame.Rect(new_x - half, self.y - half, size, size)
+        test_rect = Rect(new_x - half, self.y - half, size, size)
         if not any(test_rect.colliderect(w) for w in walls):
             self.x = new_x
             moved = True
 
         # --- Try moving on the Y axis ---
         new_y = self.y + dy
-        test_rect = pygame.Rect(self.x - half, new_y - half, size, size)
+        test_rect = Rect(self.x - half, new_y - half, size, size)
         if not any(test_rect.colliderect(w) for w in walls):
             self.y = new_y
             moved = True
@@ -105,9 +125,10 @@ class Player:
         Only works if:
           - The attacker has a knife (has_knife == True)
           - The attacker's cooldown is 0
-          - The target is within 40 pixels
+          - The target is within KNIFE_RANGE pixels
 
-        On success the target dies and the attacker's cooldown resets to 60 frames.
+        On success the target dies (with killer attribution recorded on the
+        victim) and the attacker's cooldown resets to KNIFE_COOLDOWN_FRAMES.
 
         Returns True if the kill happened, False otherwise.
         """
@@ -118,9 +139,12 @@ class Player:
         dy = self.y - target.y
         dist = math.sqrt(dx * dx + dy * dy)
 
-        if dist <= 40:
+        if dist <= KNIFE_RANGE:
             target.is_alive = False
-            self.attack_cooldown = 60
+            target.last_killer_id = self.id
+            target.last_killer_name = self.name
+            target.last_death_weapon = "knife"
+            self.attack_cooldown = KNIFE_COOLDOWN_FRAMES
             print(f"[COMBAT] {self.name} killed {target.name} with a knife!")
             return True
 
@@ -131,8 +155,9 @@ class Player:
         Fire a bullet in the given (dx, dy) direction.
 
         Only works if has_gun == True.
-        The bullet stores the shooter's role so the game knows the gun's origin.
-        The gun is consumed after firing (has_gun set to False).
+        The bullet stores the shooter's role, id and name (for accurate
+        kill-feed attribution). The gun is consumed after firing
+        (has_gun set to False).
 
         Returns the Bullet object, or None if the player can't shoot.
         """
@@ -150,7 +175,10 @@ class Player:
         norm_dy = dy / length
 
         # Create a bullet at the player's position
-        bullet = Bullet(self.x, self.y, norm_dx, norm_dy, self.role)
+        bullet = Bullet(
+            self.x, self.y, norm_dx, norm_dy, self.role,
+            shooter_id=self.id, shooter_name=self.name,
+        )
         self.has_gun = False
         print(f"[COMBAT] {self.name} fired a bullet")
         return bullet

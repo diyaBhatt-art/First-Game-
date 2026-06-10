@@ -115,6 +115,10 @@ class ShopManager:
 
         if nearest:
             nearest.is_alive = False
+            # Attribution so the kill feed / witness system credit the buyer
+            nearest.last_killer_id = buyer.id
+            nearest.last_killer_name = buyer.name
+            nearest.last_death_weapon = "knife"
             print(f"[SHADOW_BLADE] {buyer.name} instantly killed {nearest.name}!")
 
     def effect_noise_trap(self, player_id, game_state):
